@@ -1,0 +1,24 @@
+# Credentials - NEVER commit
+config/
+.env
+*.key
+token.pickle
+
+# Keep .env.example (it's a template, no secrets)
+!.env.example
+
+# Program files (personal data)
+programs/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

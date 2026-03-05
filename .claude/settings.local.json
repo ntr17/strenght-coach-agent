@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python src/run_coach.py --setup)",
+      "Bash(pip install -r requirements.txt)",
+      "Bash(python src/sheets.py)",
+      "Bash(python -c \"from config import PROGRAM_SHEET_ID; print\\(repr\\(PROGRAM_SHEET_ID\\)\\)\")",
+      "Bash(python src/run_coach.py --dry-run)",
+      "Bash(python src/run_coach.py)",
+      "Bash(where python)",
+      "Bash(schtasks.exe /create /tn \"Strength Coach Agent\" /tr \"C:\\\\Python314\\\\python.exe C:\\\\Users\\\\Nacho\\\\Documents\\\\Projects\\\\strength-coach-agent\\\\src\\\\run_coach.py\" /sc daily /st 22:00 /f)",
+      "Bash(powershell.exe -Command \"schtasks /create /tn ''Strength Coach Agent'' /tr ''C:\\\\Python314\\\\python.exe C:\\\\Users\\\\Nacho\\\\Documents\\\\Projects\\\\strength-coach-agent\\\\src\\\\run_coach.py'' /sc daily /st 22:00 /f\")",
+      "Bash(powershell.exe -Command \"schtasks /query /tn ''Strength Coach Agent'' /fo LIST\")",
+      "Bash(python -c \"import sys,base64; print\\(base64.b64encode\\(sys.stdin.buffer.read\\(\\)\\).decode\\(\\)\\)\")"
+    ]
+  }
+}

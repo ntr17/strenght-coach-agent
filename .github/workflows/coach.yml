@@ -1,0 +1,54 @@
+name: Daily Coaching Email
+
+on:
+  schedule:
+    # 21:00 UTC = 22:00 Spain (CET, winter). Adjust to 20:00 UTC in summer (CEST).
+    - cron: '0 21 * * *'
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  run-coach:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: |
+          mkdir -p config
+          echo "${{ secrets.GOOGLE_CREDENTIALS_B64 }}" | base64 -d > config/credentials.json
+          echo "${{ secrets.GOOGLE_TOKEN_B64 }}" | base64 -d > config/token.json
+
+      - name: Write .env
+        run: |
+          cat > .env << EOF
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          PROGRAM_SHEET_ID=${{ secrets.PROGRAM_SHEET_ID }}
+          MEMORY_SHEET_ID=${{ secrets.MEMORY_SHEET_ID }}
+          GMAIL_FROM=${{ secrets.GMAIL_FROM }}
+          GMAIL_TO=${{ secrets.GMAIL_TO }}
+          ATHLETE_NAME=${{ secrets.ATHLETE_NAME }}
+          CURRENT_WEEK=${{ secrets.CURRENT_WEEK }}
+          PROGRAM_START_DATE=${{ secrets.PROGRAM_START_DATE }}
+          EMAIL_HOUR=${{ secrets.EMAIL_HOUR }}
+          EOF
+
+      - name: Run coach
+        run: python src/run_coach.py
+
+      - name: Save refreshed token
+        if: always()
+        run: |
+          if [ -f config/token.json ]; then
+            NEW_TOKEN=$(base64 -w 0 config/token.json)
+            echo "Token refreshed. Update GOOGLE_TOKEN_B64 secret if needed."
+          fi
