@@ -14,7 +14,7 @@ from google.auth.transport.requests import Request
 import json
 
 from config import (
-    CREDENTIALS_FILE, TOKEN_FILE, GOOGLE_SCOPES,
+    CREDENTIALS_FILE, TOKEN_FILE, GOOGLE_SCOPES, GOOGLE_SCOPES_FULL,
     PROGRAM_SHEET_ID, compute_current_week, PROGRAM_START_DATE
 )
 
@@ -24,20 +24,29 @@ from config import (
 # ---------------------------------------------------------------------------
 
 def get_credentials() -> Credentials:
-    """Get or refresh OAuth credentials. Opens browser on first run."""
+    """
+    Get or refresh OAuth credentials. Opens browser on first run.
+    Existing tokens are loaded with GOOGLE_SCOPES (no gmail.readonly required).
+    New tokens (browser flow) request GOOGLE_SCOPES_FULL (includes gmail.readonly).
+    This means reply reading activates automatically after the user re-auths.
+    """
     creds = None
 
     if TOKEN_FILE.exists():
         with open(TOKEN_FILE) as f:
             token_data = json.load(f)
-        creds = Credentials.from_authorized_user_info(token_data, GOOGLE_SCOPES)
+        # Use the scopes stored in the token, falling back to GOOGLE_SCOPES.
+        # This avoids refresh failures when the token has fewer scopes than requested.
+        stored_scopes = token_data.get("scopes", GOOGLE_SCOPES)
+        creds = Credentials.from_authorized_user_info(token_data, stored_scopes)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            # Browser flow: request full scopes so new tokens include gmail.readonly
             flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE), GOOGLE_SCOPES
+                str(CREDENTIALS_FILE), GOOGLE_SCOPES_FULL
             )
             creds = flow.run_local_server(port=0)
 

@@ -33,6 +33,7 @@ TAB_LIFE_CONTEXT = "Life Context"
 TAB_PROGRAM_HISTORY = "Program History"
 TAB_COACH_LOG = "Coach Log"
 TAB_SHEET_REGISTRY = "Active Sheets"
+TAB_COMMANDS = "Commands"
 
 LIFT_HISTORY_HEADERS = ["Date", "Week", "Day", "Exercise", "Prescribed Weight",
                          "Actual Weight/Reps", "Completed", "Notes", "Est 1RM"]
@@ -42,6 +43,7 @@ LIFE_CONTEXT_HEADERS = ["Date", "Context"]
 PROGRAM_HISTORY_HEADERS = ["Program", "Start Date", "End Date", "Weeks Completed", "Notes"]
 COACH_LOG_HEADERS = ["Date", "Key Observations", "Email Summary"]
 SHEET_REGISTRY_HEADERS = ["Name", "Sheet ID", "Type", "Status", "Created", "Notes"]
+COMMANDS_HEADERS = ["Command", "Value", "Expires", "Applied"]
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +203,60 @@ def read_sheet_registry() -> list[dict]:
     return entries
 
 
+def read_commands() -> list[dict]:
+    """
+    Read the Commands tab. Each row: Command | Value | Expires | Applied.
+    Rows include a '_row_index' key (1-indexed, for use with mark_command_applied).
+    Returns empty list if the tab doesn't exist yet.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COMMANDS)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for i, row in enumerate(rows[1:], start=2):  # row 2 = first data row (1-indexed)
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        entry["_row_index"] = i
+        entries.append(entry)
+    return entries
+
+
+def mark_command_applied(row_index: int) -> None:
+    """Mark a command row as applied (sets the Applied column to Y)."""
+    sheet = _get_memory_sheet()
+    ws = sheet.worksheet(TAB_COMMANDS)
+    applied_col = COMMANDS_HEADERS.index("Applied") + 1  # 1-indexed
+    ws.update_cell(row_index, applied_col, "Y")
+
+
+def check_skip_today() -> Optional[date]:
+    """
+    Check for an active SKIP_UNTIL command.
+    Returns the skip-until date if today <= that date and Applied != Y.
+    Returns None if no active skip.
+    """
+    today = date.today()
+    for cmd in read_commands():
+        if cmd.get("Command", "").upper().strip() != "SKIP_UNTIL":
+            continue
+        if cmd.get("Applied", "").upper().strip() == "Y":
+            continue
+        try:
+            skip_until = datetime.strptime(cmd["Value"][:10], "%Y-%m-%d").date()
+            if today <= skip_until:
+                return skip_until
+        except (ValueError, KeyError):
+            pass
+    return None
+
+
 def get_active_program_sheet_id() -> Optional[str]:
     """
     Return the Sheet ID for the currently active Program sheet from the registry.
@@ -237,6 +293,7 @@ def read_all() -> dict:
         "program_history": read_program_history(),
         "coach_log": read_coach_log(),
         "sheet_registry": read_sheet_registry(),
+        "commands": read_commands(),
     }
 
 
@@ -530,6 +587,13 @@ def setup_memory_sheet() -> None:
     ])
     ensure_tab(TAB_COACH_LOG, COACH_LOG_HEADERS)
     ensure_tab(TAB_SHEET_REGISTRY, SHEET_REGISTRY_HEADERS)
+    ensure_tab(TAB_COMMANDS, COMMANDS_HEADERS, [
+        ["# How to use: write a command row, set Applied=N. Agent reads on each run.", "", "", ""],
+        ["# SKIP_UNTIL: skip emails until this date (inclusive). Applied stays N while active.", "", "", ""],
+        ["# EMAIL_HOUR_OVERRIDE: note a desired email hour (informational; update cron manually).", "", "", ""],
+        ["# Example row (delete the # to activate):", "", "", ""],
+        ["# SKIP_UNTIL", "2026-03-15", "", "N"],
+    ])
 
     print("Done. Review and edit the Athlete Profile and Long-Term Goals tabs directly in Google Sheets.")
     print("Remember to register your current program sheet: python src/memory.py --register-program")

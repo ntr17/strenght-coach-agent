@@ -105,7 +105,6 @@ def _summarize_week(week_data: dict) -> str:
         return "No data."
 
     title = week_data.get("title", f"Week {week_data.get('week_num', '?')}")
-    week_type = ""
     days = week_data.get("days", [])
 
     parts = [title]
@@ -487,8 +486,43 @@ def _compute_rolling_trends(health_log: list[dict], recent_weeks: list[dict]) ->
 # Main prompt builder
 # ---------------------------------------------------------------------------
 
+def _format_replies(replies: list[dict]) -> str:
+    """Format email replies from the user for inclusion in the prompt."""
+    if not replies:
+        return ""
+    lines = []
+    for r in replies:
+        lines.append(f"  [{r.get('date', '')}] Subject: {r.get('subject', '')}")
+        body = r.get("body", "").strip()
+        if body:
+            # Indent the body
+            for line in body.split("\n")[:10]:  # cap at 10 lines
+                lines.append(f"    {line}")
+    return "\n".join(lines)
+
+
+def _format_active_commands(commands: list[dict]) -> str:
+    """Format active (unapplied) commands for the agent's awareness."""
+    active = [
+        c for c in commands
+        if c.get("Applied", "").upper().strip() != "Y"
+        and not c.get("Command", "").startswith("#")
+    ]
+    if not active:
+        return ""
+    lines = []
+    for c in active:
+        line = f"  {c.get('Command', '')} | {c.get('Value', '')}"
+        if c.get("Expires"):
+            line += f" | expires: {c['Expires']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_prompt(program_data: dict, memory_data: dict,
-                 last_run_date: Optional[date] = None) -> tuple[str, str]:
+                 last_run_date: Optional[date] = None,
+                 replies: list[dict] = None,
+                 is_weekly_summary: bool = False) -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -530,11 +564,24 @@ def build_prompt(program_data: dict, memory_data: dict,
 
     # --- Date & week context ---
     week_label = f"Week {week_num}" + (f"/30, {block_info}" if block_info else "")
+    email_type = "WEEKLY SUMMARY (include charts reference)" if is_weekly_summary else "daily email"
     sections.append(
         f"Today: {today.strftime('%A, %B %d, %Y')}\n"
         f"Program: 30-Week Strength — {week_label}\n"
-        f"Coaching duration: ~{coaching_duration}"
+        f"Coaching duration: ~{coaching_duration}\n"
+        f"Email type: {email_type}"
     )
+
+    # --- Active commands (agent awareness) ---
+    commands = memory_data.get("commands", [])
+    cmd_text = _format_active_commands(commands)
+    if cmd_text:
+        sections.append(f"ACTIVE COMMANDS (from Commands tab in Coach Memory)\n{cmd_text}")
+
+    # --- User replies (email replies since last run) ---
+    if replies:
+        reply_text = _format_replies(replies)
+        sections.append(f"MESSAGES FROM YOU (email replies since last coaching email)\n{reply_text}")
 
     # --- DELTA: what's new since last email (lead with this) ---
     delta_text = _format_delta(program_data, last_run_date)
@@ -607,7 +654,15 @@ def build_prompt(program_data: dict, memory_data: dict,
         sections.append("WHAT YOU SAID RECENTLY\n" + "\n".join(cl_lines))
 
     user_message = "\n\n---\n\n".join(sections)
-    user_message += "\n\n---\n\nWrite the coaching email."
+    if is_weekly_summary:
+        user_message += (
+            "\n\n---\n\nWrite the weekly summary coaching email. "
+            "This is a Friday recap: cover the full week's performance, key trends, "
+            "and what to focus on next week. Charts for 1RM trajectory and training volume "
+            "are attached inline — reference them naturally in the text (e.g. 'as you can see in the chart below')."
+        )
+    else:
+        user_message += "\n\n---\n\nWrite the coaching email."
 
     return SYSTEM_PROMPT, user_message
 

@@ -29,6 +29,7 @@ jobs:
         run: |
           mkdir -p config
           echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > config/credentials.json
+          # Note: token.json must include gmail.readonly scope (re-auth locally if needed)
           echo "$GOOGLE_TOKEN_B64" | base64 -d > config/token.json
 
       - name: Run coach

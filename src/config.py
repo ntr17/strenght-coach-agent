@@ -54,9 +54,17 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
 # Google API scopes needed
+# NOTE: gmail.readonly is NOT listed here so existing tokens continue to work.
+# To enable email reply reading, re-auth locally after deleting config/token.json,
+# then add gmail.readonly back here and to GOOGLE_SCOPES_FULL below.
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.send",
+]
+
+# Full scopes including reply reading — used only when generating a fresh token
+GOOGLE_SCOPES_FULL = GOOGLE_SCOPES + [
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
 # Claude model

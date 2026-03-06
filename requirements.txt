@@ -9,6 +9,7 @@ anthropic>=0.18.0
 
 # Utilities
 python-dotenv>=1.0.0
+matplotlib>=3.8.0  # For weekly summary charts
 
 # Development (optional)
 pytest>=7.4.0
