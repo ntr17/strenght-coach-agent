@@ -39,7 +39,6 @@ jobs:
           GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
           GMAIL_TO: ${{ secrets.GMAIL_TO }}
           ATHLETE_NAME: ${{ secrets.ATHLETE_NAME }}
-          CURRENT_WEEK: ${{ secrets.CURRENT_WEEK }}
           PROGRAM_START_DATE: ${{ secrets.PROGRAM_START_DATE }}
           EMAIL_HOUR: ${{ secrets.EMAIL_HOUR }}
         run: python src/run_coach.py

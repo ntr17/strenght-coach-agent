@@ -16,7 +16,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, ATHLETE_NAME, CURRENT_WEEK
+from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, compute_current_week, PROGRAM_START_DATE
 
 
 # ---------------------------------------------------------------------------
@@ -81,14 +81,18 @@ def check_for_write_back_proposals(email_text: str) -> str:
 # Main run
 # ---------------------------------------------------------------------------
 
-def run(week_num: int, dry_run: bool = False, no_sync: bool = False):
+def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False):
     from sheets import read_program_data
-    from memory import read_all, sync_sessions_to_history, sync_health_log, log_coach_run
+    from memory import read_all, sync_sessions_to_history, sync_health_log, log_coach_run, get_last_run_date
     from prompt import build_prompt
+
+    # Auto-compute week if not overridden
+    if week_num is None:
+        week_num = compute_current_week(PROGRAM_START_DATE)
 
     print(f"[{date.today()}] Running coach for Week {week_num}...")
 
-    # 1. Read program sheet
+    # 1. Read program sheet (week auto-computed inside if not overridden)
     print("  Reading program sheet...")
     program_data = read_program_data(week_num=week_num)
 
@@ -96,7 +100,12 @@ def run(week_num: int, dry_run: bool = False, no_sync: bool = False):
     print("  Reading coach memory...")
     memory_data = read_all()
 
-    # 3. Sync new data to memory (unless --no-sync)
+    # 3. Get last run date for delta detection
+    last_run_date = get_last_run_date()
+    if last_run_date:
+        print(f"  Last email: {last_run_date} — computing delta...")
+
+    # 4. Sync new data to memory (unless --no-sync)
     if not no_sync:
         print("  Syncing new session data to history...")
         new_sessions = sync_sessions_to_history(program_data)
@@ -108,21 +117,21 @@ def run(week_num: int, dry_run: bool = False, no_sync: bool = False):
         if new_health:
             print(f"    → {len(new_health)} new health entries logged")
 
-    # 4. Build prompt
+    # 5. Build prompt
     print("  Building prompt...")
-    system_prompt, user_message = build_prompt(program_data, memory_data)
+    system_prompt, user_message = build_prompt(program_data, memory_data, last_run_date=last_run_date)
 
-    # 5. Generate email
+    # 6. Generate email
     print("  Generating email with Claude...")
     email_text = generate_email(system_prompt, user_message)
 
-    # 6. Check for write-back proposals
+    # 7. Check for write-back proposals
     proposal = check_for_write_back_proposals(email_text)
     if proposal:
         print(f"\n  [Write-back proposal detected]: {proposal}")
         print("  → User must confirm via daily notes before any changes are applied.")
 
-    # 7. Output
+    # 8. Output
     if dry_run:
         print("\n" + "=" * 60)
         print(f"COACHING EMAIL — {date.today()}")
@@ -137,9 +146,8 @@ def run(week_num: int, dry_run: bool = False, no_sync: bool = False):
         send_email(subject=subject, body=email_text)
         print("  Email sent.")
 
-    # 8. Log the run to Coach Memory
+    # 9. Log the run to Coach Memory
     if not no_sync and not dry_run:
-        # Derive a one-line observation summary from the email
         first_sentence = email_text.split(".")[0].strip()
         log_coach_run(
             observations=first_sentence[:200],
@@ -163,7 +171,8 @@ if __name__ == "__main__":
         setup_memory_sheet()
         sys.exit(0)
 
-    week_num = args.week or CURRENT_WEEK
+    # week_num: explicit override or None (auto-computed inside run())
+    week_num = args.week or None
 
     try:
         run(

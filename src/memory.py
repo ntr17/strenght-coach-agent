@@ -32,14 +32,16 @@ TAB_HEALTH_LOG = "Health Log"
 TAB_LIFE_CONTEXT = "Life Context"
 TAB_PROGRAM_HISTORY = "Program History"
 TAB_COACH_LOG = "Coach Log"
+TAB_SHEET_REGISTRY = "Active Sheets"
 
 LIFT_HISTORY_HEADERS = ["Date", "Week", "Day", "Exercise", "Prescribed Weight",
-                         "Actual Weight/Reps", "Completed", "Notes"]
+                         "Actual Weight/Reps", "Completed", "Notes", "Est 1RM"]
 HEALTH_LOG_HEADERS = ["Date", "Bodyweight (kg)", "Steps", "Sleep (hrs)",
                        "Food Quality (1-10)", "Sun (Y/N)", "Notes"]
 LIFE_CONTEXT_HEADERS = ["Date", "Context"]
 PROGRAM_HISTORY_HEADERS = ["Program", "Start Date", "End Date", "Weeks Completed", "Notes"]
 COACH_LOG_HEADERS = ["Date", "Key Observations", "Email Summary"]
+SHEET_REGISTRY_HEADERS = ["Name", "Sheet ID", "Type", "Status", "Created", "Notes"]
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +182,50 @@ def read_coach_log(limit: int = 7) -> list[dict]:
     return entries[-limit:]
 
 
+def read_sheet_registry() -> list[dict]:
+    """Read the Active Sheets registry."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = _get_tab(sheet, TAB_SHEET_REGISTRY)
+    except RuntimeError:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entries.append(dict(zip(headers, row + [""] * (len(headers) - len(row)))))
+    return entries
+
+
+def get_active_program_sheet_id() -> Optional[str]:
+    """
+    Return the Sheet ID for the currently active Program sheet from the registry.
+    Returns None if no active program is registered.
+    """
+    for entry in read_sheet_registry():
+        if entry.get("Type") == "Program" and entry.get("Status", "").lower() == "active":
+            return entry.get("Sheet ID", "").strip() or None
+    return None
+
+
+def get_last_run_date() -> Optional[date]:
+    """Return the date of the most recent coach run, from the Coach Log."""
+    entries = read_coach_log(limit=1)
+    if not entries:
+        return None
+    date_str = entries[-1].get("Date", "")
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def read_all() -> dict:
     """Read all Coach Memory data at once."""
     return {
@@ -190,6 +236,7 @@ def read_all() -> dict:
         "life_context": read_life_context(),
         "program_history": read_program_history(),
         "coach_log": read_coach_log(),
+        "sheet_registry": read_sheet_registry(),
     }
 
 
@@ -197,11 +244,44 @@ def read_all() -> dict:
 # Write functions
 # ---------------------------------------------------------------------------
 
+def compute_epley(weight_str: str, sets_reps_str: str) -> Optional[float]:
+    """
+    Estimate 1RM using the Epley formula: 1RM = weight * (1 + reps/30).
+    Parses weight from strings like "92.5kg", "92.5", and reps from "4x4", "3x5".
+    Returns None if parsing fails.
+    """
+    import re as _re
+    if not weight_str or not sets_reps_str:
+        return None
+    try:
+        weight_match = _re.search(r"(\d+(?:[.,]\d+)?)", str(weight_str))
+        if not weight_match:
+            return None
+        weight = float(weight_match.group(1).replace(",", "."))
+
+        # "4x4" -> reps=4, "3x5" -> reps=5 (last number = reps per set)
+        reps_match = _re.search(r"\d+[xX](\d+)", str(sets_reps_str))
+        if not reps_match:
+            # Maybe just a number like "5" meaning 5 reps
+            reps_match = _re.search(r"(\d+)", str(sets_reps_str))
+        if not reps_match:
+            return None
+        reps = int(reps_match.group(1))
+
+        if reps == 0 or weight == 0:
+            return None
+        est_1rm = weight * (1 + reps / 30)
+        return round(est_1rm, 1)
+    except (ValueError, TypeError):
+        return None
+
+
 def append_lift_history(sessions: list[dict]) -> None:
     """
     Append new session data to Lift History.
     Each session dict: {week, day_label, exercise_name, prescribed_weight,
-                        actual, completed, notes, date}
+                        actual, completed, notes, date, est_1rm (optional)}
+    Est 1RM is computed automatically if not provided.
     """
     if not sessions:
         return
@@ -210,6 +290,11 @@ def append_lift_history(sessions: list[dict]) -> None:
 
     rows = []
     for s in sessions:
+        # Use actual weight for 1RM if available, else prescribed
+        weight_for_1rm = s.get("actual") or s.get("prescribed_weight", "")
+        est_1rm = s.get("est_1rm") or compute_epley(weight_for_1rm, s.get("sets_reps", ""))
+        est_1rm_str = str(est_1rm) if est_1rm is not None else ""
+
         rows.append([
             str(s.get("date", date.today())),
             str(s.get("week", "")),
@@ -219,6 +304,7 @@ def append_lift_history(sessions: list[dict]) -> None:
             str(s.get("actual", "")),
             "Y" if s.get("completed") else ("N" if s.get("completed") is False else "?"),
             str(s.get("notes", "")),
+            est_1rm_str,
         ])
 
     ws.append_rows(rows)
@@ -249,6 +335,44 @@ def append_health_log(entries: list[dict]) -> None:
         ])
 
     ws.append_rows(rows)
+
+
+def register_sheet(name: str, sheet_id: str, sheet_type: str,
+                   status: str = "active", notes: str = "") -> None:
+    """
+    Register a sheet in the Active Sheets registry.
+    sheet_type: "Program" | "Auxiliary" | "Archive"
+    """
+    sheet = _get_memory_sheet()
+    ws = _get_tab(sheet, TAB_SHEET_REGISTRY)
+    ws.append_row([name, sheet_id, sheet_type, status, str(date.today()), notes])
+
+
+def create_and_register_sheet(name: str, sheet_type: str,
+                               tabs: list[dict] = None, notes: str = "") -> str:
+    """
+    Create a new Google Sheet, set up tabs with headers, register it in the registry.
+    tabs: list of {"title": str, "headers": list[str]} — if None, creates one blank tab.
+    Returns the new sheet ID.
+    """
+    client = get_client()
+    new_sheet = client.create(name)
+    sheet_id = new_sheet.id
+
+    if tabs:
+        # Rename the default Sheet1 to first tab, then add the rest
+        ws_default = new_sheet.get_worksheet(0)
+        ws_default.update_title(tabs[0]["title"])
+        if tabs[0].get("headers"):
+            ws_default.append_row(tabs[0]["headers"])
+
+        for tab in tabs[1:]:
+            ws = new_sheet.add_worksheet(title=tab["title"], rows=1000, cols=20)
+            if tab.get("headers"):
+                ws.append_row(tab["headers"])
+
+    register_sheet(name, sheet_id, sheet_type, status="active", notes=notes)
+    return sheet_id
 
 
 def append_life_context(context_note: str, context_date: Optional[date] = None) -> None:
@@ -320,9 +444,10 @@ def sync_sessions_to_history(program_data: dict) -> list[dict]:
                 "day_label": day_label,
                 "exercise_name": ex["name"],
                 "prescribed_weight": ex.get("weight", ""),
+                "sets_reps": ex.get("sets_reps", ""),
                 "actual": ex.get("actual", ""),
                 "completed": True,
-                "notes": ex.get("notes", ""),
+                "notes": ex.get("session_note") or ex.get("notes", ""),
             })
 
     if new_sessions:
@@ -404,8 +529,10 @@ def setup_memory_sheet() -> None:
         ["30-Week Strength Program", "2026-01-13", "", "7", "In progress as of 2026-03-05"],
     ])
     ensure_tab(TAB_COACH_LOG, COACH_LOG_HEADERS)
+    ensure_tab(TAB_SHEET_REGISTRY, SHEET_REGISTRY_HEADERS)
 
     print("Done. Review and edit the Athlete Profile and Long-Term Goals tabs directly in Google Sheets.")
+    print("Remember to register your current program sheet: python src/memory.py --register-program")
 
 
 # ---------------------------------------------------------------------------
@@ -414,9 +541,21 @@ def setup_memory_sheet() -> None:
 
 if __name__ == "__main__":
     import sys
+    sys.stdout.reconfigure(encoding="utf-8")
 
     if "--setup" in sys.argv:
         setup_memory_sheet()
+    elif "--register-program" in sys.argv:
+        # Usage: python src/memory.py --register-program "Program Name" SHEET_ID
+        args = sys.argv[sys.argv.index("--register-program") + 1:]
+        prog_name = args[0] if len(args) > 0 else "30-Week Strength Program"
+        prog_id = args[1] if len(args) > 1 else ""
+        if not prog_id:
+            from config import PROGRAM_SHEET_ID
+            prog_id = PROGRAM_SHEET_ID
+        register_sheet(prog_name, prog_id, "Program", status="active",
+                       notes="Registered via --register-program")
+        print(f"Registered '{prog_name}' (ID: {prog_id}) as active Program sheet.")
     else:
         print("Reading Coach Memory...")
         data = read_all()
@@ -426,3 +565,4 @@ if __name__ == "__main__":
         print(f"Health Log: {len(data['health_log'])} entries")
         print(f"Life Context: {len(data['life_context'])} entries")
         print(f"Coach Log: {len(data['coach_log'])} entries")
+        print(f"Sheet Registry: {len(data['sheet_registry'])} entries")

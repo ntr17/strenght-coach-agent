@@ -6,7 +6,7 @@ System prompt is stable. User message is assembled dynamically each run.
 from datetime import date, datetime
 from typing import Optional
 
-from config import ATHLETE_NAME, CURRENT_WEEK
+from config import ATHLETE_NAME, PROGRAM_START_DATE, compute_current_week
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,10 @@ def _summarize_week(week_data: dict) -> str:
 
         day_notes = []
         for e in exercises:
-            if e.get("notes") and e["notes"] not in ("", "None"):
+            if e.get("session_note") and e["session_note"] not in ("", "None"):
+                day_notes.append(f"{e['name']} [your note]: {e['session_note']}")
+            elif e.get("notes") and e["notes"] not in ("", "None"):
+                # Legacy single-notes column
                 day_notes.append(f"{e['name']}: {e['notes']}")
             if e.get("actual") and e["actual"] not in ("", "None"):
                 day_notes.append(f"{e['name']} actual: {e['actual']}")
@@ -179,8 +182,13 @@ def _format_current_week(week_data: dict) -> str:
             line = f"    [{done_sym}] {e['name']} {e.get('weight', '')} {e.get('sets_reps', '')}"
             if e.get("actual"):
                 line += f" → actual: {e['actual']}"
-            if e.get("notes"):
-                line += f" | note: {e['notes']}"
+            session_note = e.get("session_note") or e.get("notes")
+            if session_note:
+                line += f" | your note: {session_note}"
+            prog_note = e.get("program_note")
+            if prog_note and not e.get("session_note"):
+                # Only show program note if there's no session note (avoid clutter)
+                line += f" | program: {prog_note}"
             lines.append(line)
 
     wn = week_data.get("weekly_notes", {})
@@ -283,7 +291,8 @@ def _extract_questions(program_data: dict) -> list[str]:
     if current_week:
         for day in current_week.get("days", []):
             for ex in day.get("exercises", []):
-                note = ex.get("notes", "")
+                # Check session note first (user's own words), then legacy notes
+                note = ex.get("session_note") or ex.get("notes", "")
                 if note and "?" in note:
                     questions.append(f'[{day["label"]}, {ex["name"]}] "{note}"')
         wn = current_week.get("weekly_notes", {})
@@ -299,20 +308,203 @@ def _extract_questions(program_data: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Delta: what changed since the last email
+# ---------------------------------------------------------------------------
+
+def _format_delta(program_data: dict, last_run_date: Optional[date]) -> str:
+    """
+    Build a summary of what is NEW since the last coaching email.
+    Covers: newly completed sessions, new daily log entries, new notes/questions.
+    If last_run_date is None (first run), returns empty string.
+    """
+    if last_run_date is None:
+        return ""
+
+    lines = [f"Since last email ({last_run_date.strftime('%b %d')}):"]
+    found_anything = False
+
+    # New sessions from current week
+    for week_key in ("current_week", "prev_week_carryover"):
+        week = program_data.get(week_key)
+        if not week:
+            continue
+        for day in week.get("days", []):
+            day_date = day.get("date")
+            if day_date and day_date <= last_run_date:
+                continue  # session predates last email
+            for ex in day.get("exercises", []):
+                if ex.get("done") is not True:
+                    continue
+                note = ex.get("session_note") or ex.get("notes") or ""
+                line = f"  ✓ {ex['name']} {ex.get('weight', '')} {ex.get('sets_reps', '')}"
+                if ex.get("actual"):
+                    line += f" → {ex['actual']}"
+                if note:
+                    line += f" | \"{note}\""
+                lines.append(line)
+                found_anything = True
+
+    # New daily log entries
+    new_log = []
+    for entry in program_data.get("daily_log", []):
+        entry_date = entry.get("date")
+        if entry_date and entry_date > last_run_date:
+            new_log.append(entry)
+
+    if new_log:
+        found_anything = True
+        for e in new_log:
+            parts = []
+            if e.get("bodyweight"):
+                parts.append(f"BW {e['bodyweight']}kg")
+            if e.get("sleep"):
+                parts.append(f"sleep {e['sleep']}h")
+            if e.get("energy"):
+                parts.append(f"energy {e['energy']}/10")
+            if e.get("steps"):
+                parts.append(f"{int(e['steps']):,} steps")
+            if e.get("notes"):
+                parts.append(f"\"{e['notes']}\"")
+            lines.append(f"  [{e['date']}] {' | '.join(parts)}" if parts else f"  [{e['date']}] (no data)")
+
+    if not found_anything:
+        return ""
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 1RM trajectory
+# ---------------------------------------------------------------------------
+
+def _format_1rm_trajectory(lift_history: list[dict]) -> str:
+    """
+    For each key lift, show the last 4 estimated 1RM values and flag plateaus.
+    A plateau = less than 1% change across the last 3 readings.
+    """
+    key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
+    lines = []
+
+    for lift in key_lifts:
+        readings = []
+        for row in lift_history:
+            ex_name = row.get("Exercise", "")
+            if lift.lower() not in ex_name.lower():
+                continue
+            est = row.get("Est 1RM", "")
+            date_str = row.get("Date", "")
+            if not est:
+                continue
+            try:
+                readings.append((date_str, float(est)))
+            except (ValueError, TypeError):
+                pass
+
+        if not readings:
+            continue
+
+        recent = readings[-4:]  # last 4 data points
+        values = [v for _, v in recent]
+        pts = ", ".join(f"{v:.1f}kg ({d})" for d, v in recent)
+
+        plateau_flag = ""
+        if len(values) >= 3:
+            spread = max(values[-3:]) - min(values[-3:])
+            if spread / max(values[-3:]) < 0.01:
+                plateau_flag = " ⚠ PLATEAU"
+
+        lines.append(f"  {lift} est. 1RM: {pts}{plateau_flag}")
+
+    return "\n".join(lines) if lines else "No 1RM data yet (need actual weights or sets/reps logged)."
+
+
+# ---------------------------------------------------------------------------
+# Rolling trends
+# ---------------------------------------------------------------------------
+
+def _compute_rolling_trends(health_log: list[dict], recent_weeks: list[dict]) -> str:
+    """
+    Compare last 2 weeks vs last 4 weeks for key metrics.
+    Metrics: bodyweight, sleep, energy, session completion rate.
+    """
+    def avg_health(entries, key, n):
+        vals = []
+        for e in entries[-n:]:
+            try:
+                v = float(e.get(key, "") or "")
+                vals.append(v)
+            except (ValueError, TypeError):
+                pass
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    lines = []
+
+    bw_2 = avg_health(health_log, "Bodyweight (kg)", 14)
+    bw_4 = avg_health(health_log, "Bodyweight (kg)", 28)
+    if bw_2 and bw_4:
+        diff = round(bw_2 - bw_4, 1)
+        arrow = "↑" if diff > 0.2 else ("↓" if diff < -0.2 else "→")
+        lines.append(f"  Bodyweight: {bw_2}kg (2wk avg) vs {bw_4}kg (4wk avg) {arrow} {diff:+.1f}kg")
+
+    sleep_2 = avg_health(health_log, "Sleep (hrs)", 14)
+    sleep_4 = avg_health(health_log, "Sleep (hrs)", 28)
+    if sleep_2 and sleep_4:
+        diff = round(sleep_2 - sleep_4, 1)
+        arrow = "↑" if diff > 0.1 else ("↓" if diff < -0.1 else "→")
+        lines.append(f"  Sleep: {sleep_2}h (2wk avg) vs {sleep_4}h (4wk avg) {arrow}")
+
+    energy_2 = avg_health(health_log, "Food Quality (1-10)", 14)
+    energy_4 = avg_health(health_log, "Food Quality (1-10)", 28)
+    if energy_2 and energy_4:
+        diff = round(energy_2 - energy_4, 1)
+        arrow = "↑" if diff > 0.3 else ("↓" if diff < -0.3 else "→")
+        lines.append(f"  Food quality: {energy_2}/10 (2wk avg) vs {energy_4}/10 (4wk avg) {arrow}")
+
+    # Session completion rate: all_weeks from recent_weeks
+    all_weeks = recent_weeks[-4:] if recent_weeks else []
+    if len(all_weeks) >= 2:
+        def completion_rate(weeks):
+            total, done = 0, 0
+            for w in weeks:
+                for day in w.get("days", []):
+                    for ex in day.get("exercises", []):
+                        total += 1
+                        if ex.get("done") is True:
+                            done += 1
+            return round(done / total * 100, 0) if total else None
+
+        rate_2 = completion_rate(all_weeks[-2:])
+        rate_4 = completion_rate(all_weeks)
+        if rate_2 is not None and rate_4 is not None:
+            diff = rate_2 - rate_4
+            arrow = "↑" if diff > 3 else ("↓" if diff < -3 else "→")
+            lines.append(f"  Session completion: {rate_2:.0f}% (last 2wk) vs {rate_4:.0f}% (last 4wk) {arrow}")
+
+    return "\n".join(lines) if lines else "Not enough data for trend comparison yet."
+
+
+# ---------------------------------------------------------------------------
 # Main prompt builder
 # ---------------------------------------------------------------------------
 
-def build_prompt(program_data: dict, memory_data: dict) -> tuple[str, str]:
+def build_prompt(program_data: dict, memory_data: dict,
+                 last_run_date: Optional[date] = None) -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
+
+    Args:
+        program_data: Output of sheets.read_program_data()
+        memory_data: Output of memory.read_all()
+        last_run_date: Date of last coaching email (from memory.get_last_run_date())
 
     Returns:
         (system_prompt, user_message)
     """
     today = date.today()
-    week_num = program_data.get("current_week_num", CURRENT_WEEK)
+    week_num = program_data.get("current_week_num", compute_current_week(PROGRAM_START_DATE))
     progression = program_data.get("progression", {})
     current_week = program_data.get("current_week", {})
+    prev_carryover = program_data.get("prev_week_carryover")
     recent_weeks = program_data.get("recent_weeks", [])
     daily_log = program_data.get("daily_log", [])
 
@@ -321,10 +513,12 @@ def build_prompt(program_data: dict, memory_data: dict) -> tuple[str, str]:
     if week_num in progression:
         block = progression[week_num].get("block", "")
         week_type = progression[week_num].get("type", "")
-        block_info = f"Block {block} — {week_type}"
+        if block and week_type:
+            block_info = f"Block {block} — {week_type}"
+        elif block:
+            block_info = f"Block {block}"
 
     # Coaching duration (approximate)
-    from config import PROGRAM_START_DATE
     try:
         start = datetime.strptime(PROGRAM_START_DATE, "%Y-%m-%d").date()
         months = (today - start).days // 30
@@ -335,11 +529,23 @@ def build_prompt(program_data: dict, memory_data: dict) -> tuple[str, str]:
     sections = []
 
     # --- Date & week context ---
+    week_label = f"Week {week_num}" + (f"/30, {block_info}" if block_info else "")
     sections.append(
         f"Today: {today.strftime('%A, %B %d, %Y')}\n"
-        f"Program: 30-Week Strength — Week {week_num}/30, {block_info}\n"
+        f"Program: 30-Week Strength — {week_label}\n"
         f"Coaching duration: ~{coaching_duration}"
     )
+
+    # --- DELTA: what's new since last email (lead with this) ---
+    delta_text = _format_delta(program_data, last_run_date)
+    if delta_text:
+        sections.append(f"SINCE LAST EMAIL\n{delta_text}")
+
+    # --- Questions found in notes (surface early for Claude) ---
+    questions = _extract_questions(program_data)
+    if questions:
+        q_text = "\n".join(f"  {q}" for q in questions)
+        sections.append(f"QUESTIONS TO ADDRESS (weave answers into the email naturally)\n{q_text}")
 
     # --- Athlete profile ---
     profile = memory_data.get("athlete_profile", "")
@@ -357,42 +563,48 @@ def build_prompt(program_data: dict, memory_data: dict) -> tuple[str, str]:
         ctx_lines = "\n".join(f"  [{c['date']}] {c['context']}" for c in life_ctx[-5:])
         sections.append(f"RECENT LIFE CONTEXT\n{ctx_lines}")
 
-    # --- Program trajectory ---
+    # --- 1RM trajectory ---
     lift_history = memory_data.get("lift_history", [])
+    one_rm_text = _format_1rm_trajectory(lift_history)
+    sections.append(f"ESTIMATED 1RM TRAJECTORY\n{one_rm_text}")
+
+    # --- Program trajectory (start → goal vs current) ---
     trajectory = _compute_trajectory(
         program_data.get("goals", {}), progression, week_num, lift_history
     )
-    sections.append(f"PROGRAM TRAJECTORY (key lifts)\n{trajectory}")
+    sections.append(f"PROGRAM TARGETS\n{trajectory}")
 
-    # --- Current week ---
+    # --- Current week (full detail) ---
     current_week_text = _format_current_week(current_week) if current_week else "No current week data."
     sections.append(f"THIS WEEK\n{current_week_text}")
 
-    # --- Recent weeks ---
+    # --- Previous week carryover (if any recent sessions from last week) ---
+    if prev_carryover:
+        sections.append(f"PREVIOUS WEEK (carry-over / recently completed)\n{_summarize_week(prev_carryover)}")
+
+    # --- Recent weeks for trend context ---
     if recent_weeks:
-        recent_parts = []
-        for w in recent_weeks:
-            recent_parts.append(_summarize_week(w))
+        recent_parts = [_summarize_week(w) for w in recent_weeks]
         sections.append("RECENT WEEKS\n" + "\n\n".join(recent_parts))
 
-    # --- Health trends ---
+    # --- Rolling trends ---
+    all_weeks_for_trends = recent_weeks + ([prev_carryover] if prev_carryover else [])
     health_log = memory_data.get("health_log", [])
+    trends_text = _compute_rolling_trends(health_log, all_weeks_for_trends)
+    sections.append(f"SHORT-TERM TRENDS (2wk vs 4wk)\n{trends_text}")
+
+    # --- Health & lifestyle ---
     health_text = _format_health_trends(health_log, daily_log)
     sections.append(f"HEALTH & LIFESTYLE\n{health_text}")
 
     # --- Coach log (what was said recently) ---
     coach_log = memory_data.get("coach_log", [])
     if coach_log:
-        cl_lines = []
-        for entry in coach_log[-5:]:
-            cl_lines.append(f"  [{entry.get('Date', '')}] {entry.get('Key Observations', '')}")
+        cl_lines = [
+            f"  [{e.get('Date', '')}] {e.get('Key Observations', '')}"
+            for e in coach_log[-5:]
+        ]
         sections.append("WHAT YOU SAID RECENTLY\n" + "\n".join(cl_lines))
-
-    # --- Questions found in notes ---
-    questions = _extract_questions(program_data)
-    if questions:
-        q_text = "\n".join(f"  {q}" for q in questions)
-        sections.append(f"QUESTIONS IN NOTES (answer these naturally)\n{q_text}")
 
     user_message = "\n\n---\n\n".join(sections)
     user_message += "\n\n---\n\nWrite the coaching email."

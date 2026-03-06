@@ -4,7 +4,7 @@ Parses week tabs, Daily Log, Overview, and 30-Week Progression.
 """
 
 import re
-from datetime import date, datetime
+from datetime import datetime
 from typing import Optional
 
 import gspread
@@ -15,7 +15,7 @@ import json
 
 from config import (
     CREDENTIALS_FILE, TOKEN_FILE, GOOGLE_SCOPES,
-    PROGRAM_SHEET_ID, CURRENT_WEEK
+    PROGRAM_SHEET_ID, compute_current_week, PROGRAM_START_DATE
 )
 
 
@@ -82,14 +82,59 @@ def _parse_float(value) -> Optional[float]:
 # Week tab parser
 # ---------------------------------------------------------------------------
 
+def _detect_exercise_columns(header_row: list) -> dict:
+    """
+    Given the header row of a week tab (the row starting with "Exercise"),
+    return a mapping of field name -> column index.
+
+    Standard layout: Exercise(0) | Weight(1) | Sets x Reps(2) | Done(3) | Actual(4) | Notes(5)
+    Extended layout adds: Session Notes(6) or any renamed column.
+
+    The mapping is flexible: it reads column names and maps them intelligently.
+    """
+    col_map = {
+        "name": 0,
+        "weight": 1,
+        "sets_reps": 2,
+        "done": 3,
+        "actual": 4,
+        "program_note": None,
+        "session_note": None,
+    }
+
+    for i, cell in enumerate(header_row):
+        if i == 0:
+            continue
+        label = str(cell).strip().lower()
+        if not label:
+            continue
+        if label in ("weight", "load"):
+            col_map["weight"] = i
+        elif "set" in label or "rep" in label or "x rep" in label:
+            col_map["sets_reps"] = i
+        elif label in ("done", "completed", "status"):
+            col_map["done"] = i
+        elif "actual" in label:
+            col_map["actual"] = i
+        elif any(kw in label for kw in ("coach note", "program note", "instruction")):
+            col_map["program_note"] = i
+        elif any(kw in label for kw in ("session note", "athlete note", "my note", "user note")):
+            col_map["session_note"] = i
+        elif label in ("notes", "note") and col_map["program_note"] is None and col_map["session_note"] is None:
+            # Single notes column — treat as program note; agent context will explain the distinction
+            col_map["program_note"] = i
+
+    return col_map
+
+
 def _parse_week_tab(rows: list[list]) -> dict:
     """
     Parse a week tab (list of rows) into structured data.
+    Column layout is detected dynamically from the header row.
 
     Returns:
         {
             "title": "WEEK 7 — Block 2",
-            "date_cell": None,          # filled when user adds Date cells
             "days": [
                 {
                     "label": "DAY 1: Squat + Bench Heavy (~50 min)",
@@ -101,7 +146,8 @@ def _parse_week_tab(rows: list[list]) -> dict:
                             "sets_reps": "4x4",
                             "done": True,   # True/False/None
                             "actual": None,
-                            "notes": "felt heavy",
+                            "program_note": "pause at bottom",
+                            "session_note": "felt heavy",
                         }
                     ]
                 }
@@ -127,6 +173,7 @@ def _parse_week_tab(rows: list[list]) -> dict:
 
     current_day = None
     in_weekly_notes = False
+    col_map = None  # detected from the "Exercise" header row
 
     for row in rows:
         if not row:
@@ -135,12 +182,12 @@ def _parse_week_tab(rows: list[list]) -> dict:
         col0 = str(row[0]).strip() if row[0] is not None else ""
 
         # Week title (first non-empty row)
-        if not result["title"] and col0.startswith("WEEK"):
+        if not result["title"] and col0.upper().startswith("WEEK"):
             result["title"] = col0
             continue
 
         # Weekly notes section
-        if "WEEKLY NOTES" in col0:
+        if "WEEKLY NOTES" in col0.upper():
             in_weekly_notes = True
             if current_day is not None:
                 result["days"].append(current_day)
@@ -148,26 +195,22 @@ def _parse_week_tab(rows: list[list]) -> dict:
             continue
 
         if in_weekly_notes:
-            if "Bodyweight" in col0:
+            if "bodyweight" in col0.lower() or "peso" in col0.lower():
                 result["weekly_notes"]["bodyweight"] = _parse_float(row[1] if len(row) > 1 else None)
-            elif "Sleep" in col0:
+            elif "sleep" in col0.lower() or "sueño" in col0.lower():
                 result["weekly_notes"]["sleep"] = _parse_float(row[1] if len(row) > 1 else None)
-            elif "Energy" in col0:
+            elif "energy" in col0.lower() or "energía" in col0.lower():
                 result["weekly_notes"]["energy"] = _parse_float(row[1] if len(row) > 1 else None)
-            elif col0 == "Notes:":
-                # Notes may span multiple columns
-                note_parts = [str(c).strip() for c in row[1:] if c is not None]
+            elif col0.rstrip(":").lower() in ("notes", "note", "notas", "weekly notes"):
+                note_parts = [str(c).strip() for c in row[1:] if c is not None and str(c).strip()]
                 result["weekly_notes"]["notes"] = " ".join(note_parts) if note_parts else None
-            elif col0 == "Date:":
-                pass  # Date cell in weekly notes area (handled below per-day)
             continue
 
         # New day section
-        if col0.startswith("DAY "):
+        if col0.upper().startswith("DAY "):
             if current_day is not None:
                 result["days"].append(current_day)
 
-            # Check for date in same row (columns after the label)
             session_date = None
             for i in range(1, len(row)):
                 cell = row[i]
@@ -175,8 +218,7 @@ def _parse_week_tab(rows: list[list]) -> dict:
                     continue
                 cell_str = str(cell).strip()
                 if cell_str.lower().startswith("date:"):
-                    # "Date: 2026-02-17" or just "2026-02-17"
-                    date_str = cell_str.replace("Date:", "").replace("date:", "").strip()
+                    date_str = cell_str[5:].strip()
                     try:
                         session_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                     except ValueError:
@@ -194,20 +236,33 @@ def _parse_week_tab(rows: list[list]) -> dict:
             }
             continue
 
-        # Skip header rows (Exercise / Weight / ...)
+        # Header row — detect column layout
         if col0 == "Exercise":
+            col_map = _detect_exercise_columns(row)
             continue
 
         # Exercise row
         if current_day is not None and col0 and col0 not in ("", "—"):
             row_len = len(row)
+
+            def _cell(idx):
+                if idx is None or idx >= row_len:
+                    return None
+                v = row[idx]
+                return str(v).strip() if v is not None and str(v).strip() else None
+
+            # Use detected col_map if available, else fall back to positional defaults
+            cm = col_map or {"weight": 1, "sets_reps": 2, "done": 3, "actual": 4,
+                             "program_note": 5, "session_note": None}
+
             exercise = {
                 "name": col0,
-                "weight": str(row[1]).strip() if row_len > 1 and row[1] is not None else None,
-                "sets_reps": str(row[2]).strip() if row_len > 2 and row[2] is not None else None,
-                "done": _parse_done(row[3] if row_len > 3 else None),
-                "actual": str(row[4]).strip() if row_len > 4 and row[4] is not None else None,
-                "notes": str(row[5]).strip() if row_len > 5 and row[5] is not None else None,
+                "weight": _cell(cm["weight"]),
+                "sets_reps": _cell(cm["sets_reps"]),
+                "done": _parse_done(_cell(cm["done"])),
+                "actual": _cell(cm["actual"]),
+                "program_note": _cell(cm.get("program_note")),
+                "session_note": _cell(cm.get("session_note")),
             }
             current_day["exercises"].append(exercise)
 
@@ -351,24 +406,52 @@ def _parse_daily_log(rows: list[list], limit: int = 30) -> list[dict]:
 # Main read function
 # ---------------------------------------------------------------------------
 
-def read_program_data(week_num: int = CURRENT_WEEK, lookback: int = 3) -> dict:
+def get_program_sheet_id(sheet_id: Optional[str] = None) -> str:
+    """
+    Resolve the active program sheet ID.
+    Priority: explicit argument > PROGRAM_SHEET_ID env var > Coach Memory registry.
+    Raises ValueError if none found.
+    """
+    if sheet_id:
+        return sheet_id
+    if PROGRAM_SHEET_ID:
+        return PROGRAM_SHEET_ID
+    # Fall back to registry
+    from memory import get_active_program_sheet_id
+    registry_id = get_active_program_sheet_id()
+    if registry_id:
+        return registry_id
+    raise ValueError(
+        "No program sheet ID found. Set PROGRAM_SHEET_ID in .env or register a program sheet "
+        "via: python src/memory.py --register-program"
+    )
+
+
+def read_program_data(week_num: Optional[int] = None, lookback: int = 3,
+                      sheet_id: Optional[str] = None) -> dict:
     """
     Read all relevant data from the training program sheet.
 
     Args:
-        week_num: Current training week (1-30)
-        lookback: How many previous weeks to include for trend analysis
+        week_num: Override training week number. If None, auto-computed from start date.
+        lookback: How many previous weeks to include for trend analysis.
+        sheet_id: Override program sheet ID (else resolved via get_program_sheet_id()).
 
     Returns structured dict with all data the coach needs.
     """
+    if week_num is None:
+        week_num = compute_current_week(PROGRAM_START_DATE)
+
+    resolved_sheet_id = get_program_sheet_id(sheet_id)
     client = get_client()
-    sheet = client.open_by_key(PROGRAM_SHEET_ID)
+    sheet = client.open_by_key(resolved_sheet_id)
 
     result = {
         "current_week_num": week_num,
         "goals": {},
         "progression": {},
         "current_week": None,
+        "prev_week_carryover": None,  # previous week tab if it has recent/unmarked sessions
         "recent_weeks": [],
         "daily_log": [],
     }
@@ -380,37 +463,80 @@ def read_program_data(week_num: int = CURRENT_WEEK, lookback: int = 3) -> dict:
     except gspread.WorksheetNotFound:
         pass
 
-    # 30-Week Progression
-    try:
-        ws = sheet.worksheet("30-Week Progression")
-        result["progression"] = _parse_progression(ws.get_all_values())
-    except gspread.WorksheetNotFound:
-        pass
-
-    # Current week
-    try:
-        ws = sheet.worksheet(f"Week {week_num}")
-        result["current_week"] = _parse_week_tab(ws.get_all_values())
-        result["current_week"]["week_num"] = week_num
-    except gspread.WorksheetNotFound:
-        pass
-
-    # Recent weeks (lookback)
-    for w in range(max(1, week_num - lookback), week_num):
+    # 30-Week Progression (try standard name and variants)
+    for prog_tab in ("30-Week Progression", "Progression", "30-Week Targets"):
         try:
-            ws = sheet.worksheet(f"Week {w}")
-            week_data = _parse_week_tab(ws.get_all_values())
-            week_data["week_num"] = w
-            result["recent_weeks"].append(week_data)
+            ws = sheet.worksheet(prog_tab)
+            result["progression"] = _parse_progression(ws.get_all_values())
+            break
         except gspread.WorksheetNotFound:
             pass
 
-    # Daily Log (optional tab)
-    try:
-        ws = sheet.worksheet("Daily Log")
-        result["daily_log"] = _parse_daily_log(ws.get_all_values())
-    except gspread.WorksheetNotFound:
-        pass  # Tab doesn't exist yet
+    # Current week tab (try "Week N" and "Semana N" variants)
+    for tab_name in (f"Week {week_num}", f"Semana {week_num}", f"W{week_num}"):
+        try:
+            ws = sheet.worksheet(tab_name)
+            result["current_week"] = _parse_week_tab(ws.get_all_values())
+            result["current_week"]["week_num"] = week_num
+            break
+        except gspread.WorksheetNotFound:
+            pass
+
+    # Previous week — include if it has sessions that look recent or incomplete.
+    # "Recent" = any session with no date, or date within last 10 days.
+    if week_num > 1:
+        prev_num = week_num - 1
+        for tab_name in (f"Week {prev_num}", f"Semana {prev_num}", f"W{prev_num}"):
+            try:
+                ws = sheet.worksheet(tab_name)
+                prev_data = _parse_week_tab(ws.get_all_values())
+                prev_data["week_num"] = prev_num
+
+                from datetime import date as _date
+                today = _date.today()
+                has_recent = False
+                for day in prev_data.get("days", []):
+                    d = day.get("date")
+                    # Include if: session date is within 10 days OR any session has no date
+                    # and has at least one exercise marked done or unknown
+                    exercises = day.get("exercises", [])
+                    has_content = any(e.get("done") is not None or e.get("session_note") for e in exercises)
+                    if d is None and has_content:
+                        has_recent = True
+                        break
+                    if d and (today - d).days <= 10:
+                        has_recent = True
+                        break
+
+                if has_recent:
+                    result["prev_week_carryover"] = prev_data
+                break
+            except gspread.WorksheetNotFound:
+                pass
+
+    # Recent weeks for trend context (lookback, excluding the prev_week_carryover if already loaded)
+    carryover_num = result["prev_week_carryover"]["week_num"] if result["prev_week_carryover"] else None
+    for w in range(max(1, week_num - lookback), week_num):
+        if w == carryover_num:
+            continue  # already included as carryover
+        for tab_name in (f"Week {w}", f"Semana {w}", f"W{w}"):
+            try:
+                ws = sheet.worksheet(tab_name)
+                week_data = _parse_week_tab(ws.get_all_values())
+                week_data["week_num"] = w
+                result["recent_weeks"].append(week_data)
+                break
+            except gspread.WorksheetNotFound:
+                pass
+
+    # Daily Log (optional tab, try name variants)
+    for log_tab in ("Daily Log", "Log", "Diario"):
+        try:
+            ws = sheet.worksheet(log_tab)
+            result["daily_log"] = _parse_daily_log(ws.get_all_values())
+            break
+        except gspread.WorksheetNotFound:
+            pass
 
     return result
 
