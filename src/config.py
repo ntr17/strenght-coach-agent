@@ -1,3 +1,4 @@
+import base64
 import math
 import os
 import re
@@ -47,11 +48,32 @@ _CURRENT_WEEK_OVERRIDE = os.environ.get("CURRENT_WEEK", "")
 CURRENT_WEEK = int(_CURRENT_WEEK_OVERRIDE) if _CURRENT_WEEK_OVERRIDE else compute_current_week(PROGRAM_START_DATE)
 EMAIL_HOUR = int(os.environ.get("EMAIL_HOUR", "22"))  # 10 PM default
 
+# Telegram (optional — bot won't run if these are absent)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
+
+def bootstrap_google_credentials() -> None:
+    """
+    On Railway (or any environment without local credential files), decode
+    GOOGLE_CREDENTIALS_B64 and GOOGLE_TOKEN_B64 env vars and write them to
+    the expected file paths. Safe to call multiple times — skips if files exist.
+    """
+    CONFIG_DIR.mkdir(exist_ok=True)
+
+    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "")
+    if creds_b64 and not CREDENTIALS_FILE.exists():
+        CREDENTIALS_FILE.write_bytes(base64.b64decode(creds_b64))
+
+    token_b64 = os.environ.get("GOOGLE_TOKEN_B64", "")
+    if token_b64 and not TOKEN_FILE.exists():
+        TOKEN_FILE.write_bytes(base64.b64decode(token_b64))
+
 
 # Google API scopes needed
 # NOTE: gmail.readonly is NOT listed here so existing tokens continue to work.

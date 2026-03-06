@@ -10,6 +10,9 @@ Tabs:
   Life Context      - journal of context changes (agent appends)
   Program History   - programs run (agent updates)
   Coach Log         - agent's own notes and email summaries
+  Strategic Plan    - multi-month phases and targets (agent updates weekly)
+  Planning Notes    - free-form coach thinking from each planning pass
+  Telegram Log      - bidirectional conversation history with athlete
 """
 
 from datetime import date, datetime
@@ -34,6 +37,9 @@ TAB_PROGRAM_HISTORY = "Program History"
 TAB_COACH_LOG = "Coach Log"
 TAB_SHEET_REGISTRY = "Active Sheets"
 TAB_COMMANDS = "Commands"
+TAB_STRATEGIC_PLAN = "Strategic Plan"
+TAB_PLANNING_NOTES = "Planning Notes"
+TAB_TELEGRAM_LOG = "Telegram Log"
 
 LIFT_HISTORY_HEADERS = ["Date", "Week", "Day", "Exercise", "Prescribed Weight",
                          "Actual Weight/Reps", "Completed", "Notes", "Est 1RM"]
@@ -44,6 +50,9 @@ PROGRAM_HISTORY_HEADERS = ["Program", "Start Date", "End Date", "Weeks Completed
 COACH_LOG_HEADERS = ["Date", "Key Observations", "Email Summary"]
 SHEET_REGISTRY_HEADERS = ["Name", "Sheet ID", "Type", "Status", "Created", "Notes"]
 COMMANDS_HEADERS = ["Command", "Value", "Expires", "Applied"]
+STRATEGIC_PLAN_HEADERS = ["Phase", "Start Date", "End Date", "Focus", "Key Targets", "Notes", "Last Updated"]
+PLANNING_NOTES_HEADERS = ["Date", "Notes"]
+TELEGRAM_LOG_HEADERS = ["Date", "Time", "Direction", "Message"]
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +266,145 @@ def check_skip_today() -> Optional[date]:
     return None
 
 
+def read_strategic_plan() -> list[dict]:
+    """Read the Strategic Plan tab. Returns list of phase dicts."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_STRATEGIC_PLAN)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entries.append(dict(zip(headers, row + [""] * (len(headers) - len(row)))))
+    return entries
+
+
+def upsert_strategic_plan(phases: list[dict]) -> None:
+    """
+    Write/update the Strategic Plan tab.
+    Each dict should have keys matching STRATEGIC_PLAN_HEADERS.
+    Replaces all existing data rows (clears and rewrites).
+    """
+    if not phases:
+        return
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_STRATEGIC_PLAN)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_STRATEGIC_PLAN, rows=100, cols=10)
+        ws.append_row(STRATEGIC_PLAN_HEADERS)
+
+    # Clear existing data rows (keep header)
+    existing = ws.get_all_values()
+    if len(existing) > 1:
+        ws.delete_rows(2, len(existing))
+
+    rows = []
+    today = str(date.today())
+    for p in phases:
+        rows.append([
+            p.get("Phase", ""),
+            p.get("Start Date", ""),
+            p.get("End Date", ""),
+            p.get("Focus", ""),
+            p.get("Key Targets", ""),
+            p.get("Notes", ""),
+            p.get("Last Updated", today),
+        ])
+    ws.append_rows(rows)
+
+
+def append_planning_notes(notes: str, run_date: Optional[date] = None) -> None:
+    """Append a free-form planning session note."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_PLANNING_NOTES)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_PLANNING_NOTES, rows=500, cols=5)
+        ws.append_row(PLANNING_NOTES_HEADERS)
+    d = str(run_date or date.today())
+    ws.append_row([d, notes])
+
+
+def read_planning_notes(limit: int = 3) -> list[dict]:
+    """Read recent planning notes."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_PLANNING_NOTES)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entries.append({"date": row[0], "notes": row[1] if len(row) > 1 else ""})
+    return entries[-limit:]
+
+
+def append_telegram_log(direction: str, message: str,
+                         log_date: Optional[date] = None) -> None:
+    """
+    Append a Telegram message to the log.
+    direction: 'IN' (from athlete) or 'OUT' (from coach)
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TELEGRAM_LOG)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_TELEGRAM_LOG, rows=1000, cols=6)
+        ws.append_row(TELEGRAM_LOG_HEADERS)
+    now = datetime.now()
+    d = str(log_date or now.date())
+    t = now.strftime("%H:%M")
+    ws.append_row([d, t, direction.upper(), message])
+
+
+def read_telegram_log(limit: int = 10) -> list[dict]:
+    """Read recent Telegram log entries."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TELEGRAM_LOG)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entries.append(dict(zip(headers, row + [""] * (len(headers) - len(row)))))
+    return entries[-limit:]
+
+
+def read_lift_history_for_exercise(exercise_name: str) -> list[dict]:
+    """Read full Lift History for a specific exercise (for per-lift deep dive)."""
+    sheet = _get_memory_sheet()
+    ws = _get_tab(sheet, TAB_LIFT_HISTORY)
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        if exercise_name.lower() in entry.get("Exercise", "").lower():
+            entries.append(entry)
+    return entries
+
+
 def get_active_program_sheet_id() -> Optional[str]:
     """
     Return the Sheet ID for the currently active Program sheet from the registry.
@@ -294,6 +442,9 @@ def read_all() -> dict:
         "coach_log": read_coach_log(),
         "sheet_registry": read_sheet_registry(),
         "commands": read_commands(),
+        "strategic_plan": read_strategic_plan(),
+        "planning_notes": read_planning_notes(),
+        "telegram_log": read_telegram_log(),
     }
 
 
@@ -594,6 +745,15 @@ def setup_memory_sheet() -> None:
         ["# Example row (delete the # to activate):", "", "", ""],
         ["# SKIP_UNTIL", "2026-03-15", "", "N"],
     ])
+
+    ensure_tab(TAB_STRATEGIC_PLAN, STRATEGIC_PLAN_HEADERS, [
+        ["# Coach fills this in via --think. Each row = one training phase/block.", "", "", "", "", "", ""],
+        ["# Example (delete # to activate):", "", "", "", "", "", ""],
+        ["# Strength Peak", "2026-01-13", "2026-04-30", "Max squat/bench", "Squat 120kg, Bench 105kg", "Current block", ""],
+    ])
+
+    ensure_tab(TAB_PLANNING_NOTES, PLANNING_NOTES_HEADERS)
+    ensure_tab(TAB_TELEGRAM_LOG, TELEGRAM_LOG_HEADERS)
 
     print("Done. Review and edit the Athlete Profile and Long-Term Goals tabs directly in Google Sheets.")
     print("Remember to register your current program sheet: python src/memory.py --register-program")

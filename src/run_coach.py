@@ -8,6 +8,7 @@ Usage:
   python src/run_coach.py --setup      # Set up Coach Memory Sheet (first-time only)
   python src/run_coach.py --no-sync    # Skip writing new data to Coach Memory (read-only)
   python src/run_coach.py --weekly     # Force a weekly summary email with charts
+  python src/run_coach.py --think      # Run strategic planning pass only (no email)
 """
 
 import argparse
@@ -37,6 +38,8 @@ def parse_args():
                         help="Skip writing new data to Coach Memory (read-only run)")
     parser.add_argument("--weekly", action="store_true",
                         help="Force a weekly summary email with charts (normally auto on Fridays)")
+    parser.add_argument("--think", action="store_true",
+                        help="Run strategic planning pass only — updates Coach Memory, no email sent")
     return parser.parse_args()
 
 
@@ -96,6 +99,69 @@ def generate_email(system_prompt: str, user_message: str, analysis: str = "") ->
 
 
 # ---------------------------------------------------------------------------
+# Extract [TELEGRAM: ...] proactive alert from email text
+# ---------------------------------------------------------------------------
+
+def extract_telegram_alert(email_text: str) -> tuple[str, str]:
+    """
+    Look for [TELEGRAM: message] at the end of the email.
+    Returns (clean_email_text, telegram_message).
+    The marker is stripped from the email before sending.
+    """
+    import re
+    pattern = r'\[TELEGRAM:\s*(.*?)\]'
+    match = re.search(pattern, email_text, re.IGNORECASE | re.DOTALL)
+    if match:
+        tg_msg = match.group(1).strip()
+        clean = re.sub(pattern, '', email_text, flags=re.IGNORECASE | re.DOTALL).strip()
+        return clean, tg_msg
+    return email_text, ""
+
+
+# ---------------------------------------------------------------------------
+# Plateau detection: find stalled lifts and run deep dives
+# ---------------------------------------------------------------------------
+
+def detect_plateaus_and_deep_dive(lift_history: list[dict], system_prompt: str) -> dict:
+    """
+    Check 1RM trajectory for each key lift. If plateaued, fetch full history
+    and run a focused analysis. Returns {lift_name: analysis_text}.
+    """
+    from planner import run_lift_deep_dive
+    from memory import read_lift_history_for_exercise
+
+    key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
+    plateau_dives = {}
+
+    for lift in key_lifts:
+        readings = []
+        for row in lift_history:
+            if lift.lower() not in row.get("Exercise", "").lower():
+                continue
+            est = row.get("Est 1RM", "")
+            if not est:
+                continue
+            try:
+                readings.append(float(est))
+            except (ValueError, TypeError):
+                pass
+
+        if len(readings) < 3:
+            continue
+
+        recent = readings[-3:]
+        spread = max(recent) - min(recent)
+        if max(recent) > 0 and spread / max(recent) < 0.01:
+            print(f"    → Plateau detected for {lift}, running deep dive...")
+            full_history = read_lift_history_for_exercise(lift)
+            analysis = run_lift_deep_dive(lift, full_history, system_prompt)
+            if analysis:
+                plateau_dives[lift] = analysis
+
+    return plateau_dives
+
+
+# ---------------------------------------------------------------------------
 # Write-back: check if agent wants to propose a program change
 # ---------------------------------------------------------------------------
 
@@ -118,6 +184,24 @@ def check_for_write_back_proposals(email_text: str) -> str:
 # ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
+
+def run_think(week_num: int = None, dry_run: bool = False):
+    """Run the strategic planning pass only. No email sent."""
+    from sheets import read_program_data
+    from memory import read_all
+    from planner import run_planning_pass
+
+    if week_num is None:
+        week_num = compute_current_week(PROGRAM_START_DATE)
+
+    today = date.today()
+    print(f"[{today}] Running strategic planning pass for Week {week_num}...")
+
+    program_data = read_program_data(week_num=week_num)
+    memory_data = read_all()
+    run_planning_pass(program_data, memory_data, week_num, dry_run=dry_run)
+    print("Planning pass complete.")
+
 
 def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         force_weekly: bool = False):
@@ -177,7 +261,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         if new_health:
             print(f"    → {len(new_health)} new health entries logged")
 
-    # 6. Build prompt
+    # 6. Build prompt (initial pass, without plateau dives)
     print("  Building prompt...")
     system_prompt, user_message = build_prompt(
         program_data, memory_data,
@@ -186,7 +270,21 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         is_weekly_summary=is_weekly_summary,
     )
 
-    # 7. Analysis pass (reasoning before writing)
+    # 7. Plateau detection + per-lift deep dives
+    print("  Checking for plateaus...")
+    lift_history = memory_data.get("lift_history", [])
+    plateau_dives = detect_plateaus_and_deep_dive(lift_history, system_prompt)
+    if plateau_dives:
+        # Rebuild prompt with deep dive context included
+        system_prompt, user_message = build_prompt(
+            program_data, memory_data,
+            last_run_date=last_run_date,
+            replies=replies,
+            is_weekly_summary=is_weekly_summary,
+            plateau_deep_dives=plateau_dives,
+        )
+
+    # 8. Analysis pass (reasoning before writing)
     print("  Running analysis pass...")
     analysis = generate_analysis(system_prompt, user_message)
     if dry_run:
@@ -194,17 +292,22 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         print(analysis)
         print("--- END ANALYSIS ---\n")
 
-    # 8. Generate email
+    # 9. Generate email
     print("  Generating email with Claude...")
     email_text = generate_email(system_prompt, user_message, analysis=analysis)
 
-    # 9. Check for write-back proposals
+    # 10. Extract proactive Telegram alert (if coach included one)
+    email_text, tg_alert = extract_telegram_alert(email_text)
+    if tg_alert:
+        print(f"  [Telegram alert detected]: {tg_alert}")
+
+    # 11. Check for write-back proposals
     proposal = check_for_write_back_proposals(email_text)
     if proposal:
         print(f"\n  [Write-back proposal detected]: {proposal}")
         print("  → User must confirm via daily notes before any changes are applied.")
 
-    # 10. Generate charts (on Fridays / weekly summary)
+    # 12. Generate charts (on Fridays / weekly summary)
     charts = None
     if is_weekly_summary:
         print("  Generating charts...")
@@ -228,7 +331,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         except ImportError:
             print("    → matplotlib not installed, skipping charts")
 
-    # 11. Output
+    # 13. Output
     if dry_run:
         print("\n" + "=" * 60)
         print(f"COACHING EMAIL — {today}")
@@ -236,6 +339,8 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         print(email_text)
         if charts:
             print(f"\n[{len(charts)} chart(s) would be attached inline]")
+        if tg_alert:
+            print(f"\n[Telegram alert would send]: {tg_alert}")
         print("=" * 60)
         print("[DRY RUN — email not sent]")
     else:
@@ -249,7 +354,16 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         send_email(subject=subject, body=email_text, charts=charts or [])
         print("  Email sent.")
 
-    # 12. Log the run to Coach Memory
+        # Send proactive Telegram alert if coach flagged one
+        if tg_alert:
+            try:
+                from telegram_utils import send_telegram_message
+                send_telegram_message(tg_alert)
+                print(f"  Telegram alert sent: {tg_alert[:80]}")
+            except Exception as e:
+                print(f"  Telegram alert failed (non-fatal): {e}")
+
+    # 14. Log the run to Coach Memory
     if not no_sync and not dry_run:
         first_sentence = email_text.split(".")[0].strip()
         log_coach_run(
@@ -277,12 +391,15 @@ if __name__ == "__main__":
     week_num = args.week or None
 
     try:
-        run(
-            week_num=week_num,
-            dry_run=args.dry_run,
-            no_sync=args.no_sync,
-            force_weekly=args.weekly,
-        )
+        if args.think:
+            run_think(week_num=week_num, dry_run=args.dry_run)
+        else:
+            run(
+                week_num=week_num,
+                dry_run=args.dry_run,
+                no_sync=args.no_sync,
+                force_weekly=args.weekly,
+            )
     except KeyboardInterrupt:
         print("\nAborted.")
         sys.exit(0)

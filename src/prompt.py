@@ -13,27 +13,29 @@ from config import ATHLETE_NAME, PROGRAM_START_DATE, compute_current_week
 # System prompt (stable, loaded every run)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""You are a long-term strength coach for {ATHLETE_NAME}.
+SYSTEM_PROMPT = f"""You are {ATHLETE_NAME}'s long-term strength coach. You've been working with him for months. You know him well — his patterns, his excuses, his genuine effort, his life outside the gym.
 
-You know this person well — their training history, their life situation, their tendencies, their blind spots. You've seen them progress, stall, travel, grind, and question themselves.
+You care about this person. Not in a sentimental way — in the way a good coach cares: you want him to succeed, you pay attention to what's actually happening with him, and you hold him to a standard because you believe he can meet it. You're not here to make him feel good. You're here to make him better.
+
+You think in years, not weeks. You have a roadmap in your head for where he's going — the next program, the next phase after that, the target he's building toward. Today's session is one data point in a much longer story. You keep that context active.
 
 Your coaching philosophy:
-- Direct and honest. You never pander. If something is wrong, you say so.
-- Data over motivation. You interpret numbers, not just report them.
-- You remember where they started and how far they've come — you remind them when they can't see it.
-- You notice patterns they miss: short-term stalls, long-term trends, lifestyle factors affecting training.
-- You have your own professional criteria. You give your opinion. You might disagree with their instincts — you say so clearly.
-- When you want to change the program (weights, structure, anything), you always propose it and ask for confirmation first. Never change anything silently.
-- You answer questions naturally within your coaching — not in a separate Q&A block, just woven in.
+- Direct and honest. If something is wrong, you name it clearly. No softening.
+- Data over motivation. You interpret numbers; you don't cheerleaded them.
+- You remember where he started. When he can't see progress, you remind him with specifics.
+- You notice what he misses: the pattern building across weeks, the lifestyle factor compounding against him, the thing he wrote in a note three weeks ago that's relevant now.
+- You have professional opinions. You sometimes disagree with his instincts. You say so.
+- You never change the program without asking. Always propose, always confirm first.
+- You answer his questions woven naturally into the coaching — never in a separate block.
+- If there's a proactive alert worth a quick Telegram message (plateau breaking, something urgent, a milestone), append it at the very end using this exact format on its own line: [TELEGRAM: your brief message here]
 
 Email format:
-- Write in natural prose. No section headers. No bullet lists unless they genuinely help.
-- Length matches what's relevant. Rest day with no news: 2-3 sentences. Heavy training day with a question and a trend: several paragraphs.
-- Don't repeat the data back at them. Interpret it. Tell them what it means.
-- If nothing notable happened, say less.
-- Tone: like a coach who knows you well and doesn't waste your time.
+- Natural prose. No section headers. No bullet lists unless they genuinely help.
+- Length matches what's relevant: rest day with nothing to say = 2 sentences; training day with a question and a trend = several paragraphs.
+- Don't recite the data. Interpret it. Tell him what it means.
+- Tone: a coach who knows him well and doesn't waste his time. Warm but not gushing.
 
-If you want to propose a program change (weight adjustment, exercise swap, new block), state it clearly at the end and ask for confirmation. Format: "One thing: [proposal]. Want me to update the sheet?"
+If you want to propose a program change (weight, structure, anything): state it clearly and ask. Format: "One thing: [proposal]. Want me to update the sheet?"
 """
 
 
@@ -519,10 +521,63 @@ def _format_active_commands(commands: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_strategic_plan(strategic_plan: list[dict]) -> str:
+    """Format the strategic plan phases for inclusion in the prompt."""
+    phases = [p for p in strategic_plan if not p.get("Phase", "").startswith("#")]
+    if not phases:
+        return ""
+    today = date.today()
+    lines = []
+    for p in phases:
+        phase_name = p.get("Phase", "?")
+        start = p.get("Start Date", "?")
+        end = p.get("End Date", "?")
+        focus = p.get("Focus", "?")
+        targets = p.get("Key Targets", "")
+        notes = p.get("Notes", "")
+
+        # Mark current phase
+        current_marker = ""
+        try:
+            from datetime import datetime as _dt
+            s = _dt.strptime(start, "%Y-%m-%d").date()
+            e = _dt.strptime(end, "%Y-%m-%d").date()
+            if s <= today <= e:
+                current_marker = " ← CURRENT"
+        except (ValueError, TypeError):
+            pass
+
+        line = f"  {phase_name} ({start} → {end}){current_marker}: {focus}"
+        if targets:
+            line += f" | targets: {targets}"
+        if notes:
+            line += f" | {notes}"
+        lines.append(line)
+
+    updated_label = f" [last updated: {phases[-1].get('Last Updated', '?')}]" if phases else ""
+    return f"Phases{updated_label}:\n" + "\n".join(lines)
+
+
+def _format_telegram_log(telegram_log: list[dict]) -> str:
+    """Format recent Telegram messages for inclusion in the prompt."""
+    if not telegram_log:
+        return ""
+    lines = []
+    for entry in telegram_log:
+        direction = entry.get("Direction", "")
+        msg = entry.get("Message", "").strip()
+        d = entry.get("Date", "")
+        t = entry.get("Time", "")
+        label = "You" if direction == "IN" else "Coach"
+        lines.append(f"  [{d} {t}] {label}: {msg}")
+    return "\n".join(lines)
+
+
 def build_prompt(program_data: dict, memory_data: dict,
                  last_run_date: Optional[date] = None,
                  replies: list[dict] = None,
-                 is_weekly_summary: bool = False) -> tuple[str, str]:
+                 is_weekly_summary: bool = False,
+                 plateau_deep_dives: dict = None) -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -530,6 +585,7 @@ def build_prompt(program_data: dict, memory_data: dict,
         program_data: Output of sheets.read_program_data()
         memory_data: Output of memory.read_all()
         last_run_date: Date of last coaching email (from memory.get_last_run_date())
+        plateau_deep_dives: Dict of {lift_name: analysis_text} for plateaued lifts
 
     Returns:
         (system_prompt, user_message)
@@ -610,6 +666,22 @@ def build_prompt(program_data: dict, memory_data: dict,
         ctx_lines = "\n".join(f"  [{c['date']}] {c['context']}" for c in life_ctx[-5:])
         sections.append(f"RECENT LIFE CONTEXT\n{ctx_lines}")
 
+    # --- Strategic plan (your internal roadmap) ---
+    strategic_plan = memory_data.get("strategic_plan", [])
+    if strategic_plan:
+        plan_text = _format_strategic_plan(strategic_plan)
+        if plan_text:
+            sections.append(
+                f"YOUR COACHING ROADMAP (internal — updated weekly via planning pass)\n{plan_text}\n"
+                "Use this to inform today's message. Surface relevant parts naturally — only when it matters."
+            )
+
+    # --- Recent Telegram conversation ---
+    telegram_log = memory_data.get("telegram_log", [])
+    if telegram_log:
+        tg_text = _format_telegram_log(telegram_log)
+        sections.append(f"RECENT TELEGRAM CONVERSATION\n{tg_text}")
+
     # --- 1RM trajectory ---
     lift_history = memory_data.get("lift_history", [])
     one_rm_text = _format_1rm_trajectory(lift_history)
@@ -652,6 +724,16 @@ def build_prompt(program_data: dict, memory_data: dict,
             for e in coach_log[-5:]
         ]
         sections.append("WHAT YOU SAID RECENTLY\n" + "\n".join(cl_lines))
+
+    # --- Plateau deep dives (per-lift analysis when plateau detected) ---
+    if plateau_deep_dives:
+        dive_lines = []
+        for lift, analysis in plateau_deep_dives.items():
+            dive_lines.append(f"  {lift}:\n  {analysis.strip()}")
+        sections.append(
+            "PLATEAU DEEP DIVES (full history analysis for stalled lifts)\n" +
+            "\n\n".join(dive_lines)
+        )
 
     user_message = "\n\n---\n\n".join(sections)
     if is_weekly_summary:

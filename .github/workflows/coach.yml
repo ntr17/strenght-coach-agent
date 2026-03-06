@@ -42,4 +42,27 @@ jobs:
           ATHLETE_NAME: ${{ secrets.ATHLETE_NAME }}
           PROGRAM_START_DATE: ${{ secrets.PROGRAM_START_DATE }}
           EMAIL_HOUR: ${{ secrets.EMAIL_HOUR }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python src/run_coach.py
+
+      - name: Run strategic planning pass (Fridays only)
+        if: github.event_name == 'schedule' && startsWith(github.event.schedule, '0 21') && (github.run_attempt == 1)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROGRAM_SHEET_ID: ${{ secrets.PROGRAM_SHEET_ID }}
+          MEMORY_SHEET_ID: ${{ secrets.MEMORY_SHEET_ID }}
+          GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
+          GMAIL_TO: ${{ secrets.GMAIL_TO }}
+          ATHLETE_NAME: ${{ secrets.ATHLETE_NAME }}
+          PROGRAM_START_DATE: ${{ secrets.PROGRAM_START_DATE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Only run on Fridays (day of week = 5)
+          if [ "$(date +%u)" = "5" ]; then
+            echo "Friday — running strategic planning pass..."
+            python src/run_coach.py --think
+          else
+            echo "Not Friday — skipping planning pass."
+          fi
