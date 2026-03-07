@@ -6,6 +6,8 @@ Uses matplotlib to produce inline PNG images (no files written to disk).
 from io import BytesIO
 from typing import Optional
 
+from config import KEY_LIFTS  # fallback when tracked_lifts not passed
+
 
 def _get_plt():
     """Import matplotlib lazily (not needed on every run)."""
@@ -15,12 +17,19 @@ def _get_plt():
     return plt
 
 
-def generate_1rm_chart(lift_history: list[dict]) -> Optional[BytesIO]:
+def generate_1rm_chart(lift_history: list[dict],
+                        tracked_lifts: list[dict] = None) -> Optional[BytesIO]:
     """
     Generate a line chart of estimated 1RM over time for key lifts.
+    Shows MAIN + AUXILIARY lifts. Falls back to KEY_LIFTS if tracked_lifts not provided.
     Returns a BytesIO PNG, or None if there's not enough data.
     """
-    key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
+    if tracked_lifts:
+        lifts_to_chart = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
+                          if tl.get("lift_type", "MAIN") in ("MAIN", "AUXILIARY")]
+    else:
+        lifts_to_chart = KEY_LIFTS
+
     lift_data: dict[str, list[tuple[str, float]]] = {}
 
     for row in lift_history:
@@ -29,7 +38,7 @@ def generate_1rm_chart(lift_history: list[dict]) -> Optional[BytesIO]:
         date_str = row.get("Date", "")
         if not est or not date_str:
             continue
-        for lift in key_lifts:
+        for _domain, lift in lifts_to_chart:
             if lift.lower() in ex_name.lower():
                 try:
                     lift_data.setdefault(lift, []).append((date_str, float(est)))

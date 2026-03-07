@@ -42,10 +42,37 @@ MEMORY_SHEET_ID = _extract_sheet_id(os.environ["MEMORY_SHEET_ID"])
 GMAIL_FROM = os.environ["GMAIL_FROM"]
 GMAIL_TO = os.environ["GMAIL_TO"]
 ATHLETE_NAME = os.environ.get("ATHLETE_NAME", "Nacho")
-PROGRAM_START_DATE = os.environ.get("PROGRAM_START_DATE", "2026-01-13")
+PROGRAM_START_DATE = os.environ.get("PROGRAM_START_DATE", "")  # optional override
+PROGRAM_TOTAL_WEEKS = int(os.environ.get("PROGRAM_TOTAL_WEEKS", "0"))  # 0 = read from registry
+
+
+def resolve_program_start_date(fallback: str = "2026-01-13") -> str:
+    """
+    Resolve PROGRAM_START_DATE: env var override → Active Sheets registry → fallback.
+    Reads lazily so the registry import only happens when needed.
+    """
+    if PROGRAM_START_DATE:
+        return PROGRAM_START_DATE
+    try:
+        # Import here to avoid circular imports at module load time
+        _sys.path.insert(0, str(Path(__file__).parent))
+        from memory import get_active_program_info
+        info = get_active_program_info()
+        if info and info.get("start_date"):
+            return info["start_date"]
+    except Exception:
+        pass
+    return fallback
+
+
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent))
+
 # CURRENT_WEEK env var is an optional manual override; normally computed from date.
 _CURRENT_WEEK_OVERRIDE = os.environ.get("CURRENT_WEEK", "")
-CURRENT_WEEK = int(_CURRENT_WEEK_OVERRIDE) if _CURRENT_WEEK_OVERRIDE else compute_current_week(PROGRAM_START_DATE)
+CURRENT_WEEK = int(_CURRENT_WEEK_OVERRIDE) if _CURRENT_WEEK_OVERRIDE else compute_current_week(
+    PROGRAM_START_DATE or "2026-01-13"
+)
 EMAIL_HOUR = int(os.environ.get("EMAIL_HOUR", "22"))  # 10 PM default
 
 # Telegram (optional — bot won't run if these are absent)
@@ -91,3 +118,23 @@ GOOGLE_SCOPES_FULL = GOOGLE_SCOPES + [
 
 # Claude model
 CLAUDE_MODEL = "claude-sonnet-4-6"
+
+# ---------------------------------------------------------------------------
+# Canonical lift list
+# ---------------------------------------------------------------------------
+
+# Each tuple: (domain_name, lift_name_substring)
+# domain_name   — used as the Coach State domain key (uppercase, no spaces)
+# lift_name     — matched as substring against the "Exercise" column in Lift History
+#                 (case-insensitive). Keep broad enough to catch variants:
+#                 "Row" → "Barbell Row", "Pendlay Row", "DB Row"
+#                 "Pull-up" → "Pull-up", "Pull up", "Chin-up", "Chinup"
+KEY_LIFTS: list[tuple[str, str]] = [
+    ("SQUAT",    "Squat"),
+    ("BENCH",    "Bench Press"),
+    ("DEADLIFT", "Deadlift"),
+    ("OHP",      "OHP"),
+    ("ROW",      "Row"),
+    ("PULLUP",   "Pull-up"),
+    ("DIP",      "Dip"),
+]

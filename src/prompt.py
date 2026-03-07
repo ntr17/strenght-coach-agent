@@ -6,36 +6,39 @@ System prompt is stable. User message is assembled dynamically each run.
 from datetime import date, datetime
 from typing import Optional
 
-from config import ATHLETE_NAME, PROGRAM_START_DATE, compute_current_week
+from config import ATHLETE_NAME, KEY_LIFTS, compute_current_week, resolve_program_start_date
 
 
 # ---------------------------------------------------------------------------
 # System prompt (stable, loaded every run)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""You are {ATHLETE_NAME}'s long-term strength coach. You've been working with him for months. You know him well — his patterns, his excuses, his genuine effort, his life outside the gym.
+SYSTEM_PROMPT = f"""You are {ATHLETE_NAME}'s long-term strength coach. You've been working together for months. You know him — his patterns, his real effort vs his excuses, how his work schedule compresses his sleep, how he travels and loses a week then comes back strong. You know what he's building toward, years from now.
 
-You care about this person. Not in a sentimental way — in the way a good coach cares: you want him to succeed, you pay attention to what's actually happening with him, and you hold him to a standard because you believe he can meet it. You're not here to make him feel good. You're here to make him better.
+You care about this person the way a serious coach does: you hold him to a standard because you believe he can meet it. You're not here to make him feel good. You're here to make him better. That means being honest when things are off, pushing on things he's ignoring, and knowing when to back off because the context is clear.
 
-You think in years, not weeks. You have a roadmap in your head for where he's going — the next program, the next phase after that, the target he's building toward. Today's session is one data point in a much longer story. You keep that context active.
+**How you think:**
+You distinguish signal from noise. A missed session because of a flight is noise — acknowledge it briefly, move on. Three consecutive Tuesdays missed is a pattern — address it directly. A new PR is a landmark — log it, reference it for weeks. Your job is to help him focus on what actually matters, not to report everything.
 
-Your coaching philosophy:
-- Direct and honest. If something is wrong, you name it clearly. No softening.
-- Data over motivation. You interpret numbers; you don't cheerleaded them.
-- You remember where he started. When he can't see progress, you remind him with specifics.
-- You notice what he misses: the pattern building across weeks, the lifestyle factor compounding against him, the thing he wrote in a note three weeks ago that's relevant now.
-- You have professional opinions. You sometimes disagree with his instincts. You say so.
-- You never change the program without asking. Always propose, always confirm first.
-- You answer his questions woven naturally into the coaching — never in a separate block.
-- If there's a proactive alert worth a quick Telegram message (plateau breaking, something urgent, a milestone), append it at the very end using this exact format on its own line: [TELEGRAM: your brief message here]
+You have a watch list. You track concerns over time: a sleep trend declining for three weeks, a plateau on bench that's lasted a month, a question he asked that you haven't fully answered. You follow up on things you said you'd watch. You notice when something you flagged last week has been resolved. You don't repeat yourself on things that are stale.
 
-Email format:
+You have your own agenda. You push on things he's not paying attention to — VO2 max if it's trending down, carb timing given his insulin resistance, recovery if workload is compounding. If you've raised something and he rejected it with a good reason, you update your model. If the reason was weak, you come back to it.
+
+You think in years. Today is one data point. You have a roadmap for where he's going — the next program, the phase after that, the real target. You surface this context when it matters, not every day.
+
+**Output markers** (stripped before athlete sees them — update your internal state):
+- [TRACKING: description] — start watching something new (OPEN concern)
+- [LANDMARK: description] — log an important event (PR, milestone, injury, decision)
+- [FOLLOWUP: what to check next time] — remind yourself to follow up
+- [RESOLVED: text matching what you were tracking] — close an open item
+- [TELEGRAM: brief message] — send a proactive Telegram alert
+
+**Email format:**
 - Natural prose. No section headers. No bullet lists unless they genuinely help.
-- Length matches what's relevant: rest day with nothing to say = 2 sentences; training day with a question and a trend = several paragraphs.
+- Length matches relevance: nothing happened = 2 sentences; real data + question + trend = several paragraphs.
 - Don't recite the data. Interpret it. Tell him what it means.
-- Tone: a coach who knows him well and doesn't waste his time. Warm but not gushing.
-
-If you want to propose a program change (weight, structure, anything): state it clearly and ask. Format: "One thing: [proposal]. Want me to update the sheet?"
+- Tone: someone who knows him well and doesn't waste his time. Warm, direct, not gushing.
+- Never change the program without asking. Proposal format: "One thing: [proposal]. Want me to update the sheet?"
 """
 
 
@@ -58,17 +61,18 @@ def _fmt_optional(val, suffix="") -> str:
 
 
 def _compute_trajectory(goals: dict, progression: dict, current_week: int,
-                         lift_history: list[dict]) -> str:
+                         lift_history: list[dict],
+                         tracked_lifts: list[dict] = None) -> str:
     """
     Simple trajectory for key lifts: compare recent actual performance
     to progression table targets and project forward.
     """
-    key_lifts = {
-        "Squat": "Squat",
-        "Bench Press": "Bench",
-        "OHP": "OHP",
-        "Deadlift": "Deadlift",
-    }
+    # Build {lift_name: domain_title} from tracked lifts (MAIN+AUXILIARY), fallback KEY_LIFTS
+    if tracked_lifts:
+        key_lifts = {tl["match_pattern"]: tl["domain"].title() for tl in tracked_lifts
+                     if tl.get("lift_type", "MAIN") in ("MAIN", "AUXILIARY")}
+    else:
+        key_lifts = {lift_name: domain.title() for domain, lift_name in KEY_LIFTS}
 
     lines = []
     for goal_name, prog_key in key_lifts.items():
@@ -378,15 +382,22 @@ def _format_delta(program_data: dict, last_run_date: Optional[date]) -> str:
 # 1RM trajectory
 # ---------------------------------------------------------------------------
 
-def _format_1rm_trajectory(lift_history: list[dict]) -> str:
+def _format_1rm_trajectory(lift_history: list[dict],
+                            tracked_lifts: list[dict] = None) -> str:
     """
     For each key lift, show the last 4 estimated 1RM values and flag plateaus.
     A plateau = less than 1% change across the last 3 readings.
+    Shows MAIN + AUXILIARY lifts. Falls back to KEY_LIFTS if not provided.
     """
-    key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
     lines = []
 
-    for lift in key_lifts:
+    if tracked_lifts:
+        lifts_to_show = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
+                         if tl.get("lift_type", "MAIN") in ("MAIN", "AUXILIARY")]
+    else:
+        lifts_to_show = KEY_LIFTS
+
+    for _domain, lift in lifts_to_show:
         readings = []
         for row in lift_history:
             ex_name = row.get("Exercise", "")
@@ -504,7 +515,11 @@ def _format_replies(replies: list[dict]) -> str:
 
 
 def _format_active_commands(commands: list[dict]) -> str:
-    """Format active (unapplied) commands for the agent's awareness."""
+    """
+    Format active (unapplied) commands for the agent's awareness.
+    PENDING_PROPOSALs are surfaced prominently — the coach needs to know
+    it asked a question and should look for the athlete's reply.
+    """
     active = [
         c for c in commands
         if c.get("Applied", "").upper().strip() != "Y"
@@ -513,7 +528,20 @@ def _format_active_commands(commands: list[dict]) -> str:
     if not active:
         return ""
     lines = []
+    proposals = []
+    other = []
     for c in active:
+        if c.get("Command", "").upper() == "PENDING_PROPOSAL":
+            proposals.append(c)
+        else:
+            other.append(c)
+
+    if proposals:
+        lines.append("  AWAITING ATHLETE CONFIRMATION (check replies above):")
+        for c in proposals:
+            lines.append(f"    → {c.get('Value', '')}")
+
+    for c in other:
         line = f"  {c.get('Command', '')} | {c.get('Value', '')}"
         if c.get("Expires"):
             line += f" | expires: {c['Expires']}"
@@ -573,11 +601,85 @@ def _format_telegram_log(telegram_log: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_coach_focus(coach_focus: list[dict]) -> str:
+    """
+    Format the coach's active watch list for inclusion in the prompt.
+    Only shows OPEN items. PINNED items always shown first; HIGH/NORMAL items follow.
+    """
+    open_items = [f for f in coach_focus if f.get("Status", "OPEN") == "OPEN"
+                  and not f.get("Item", "").startswith("#")]
+    if not open_items:
+        return ""
+
+    # Sort: PINNED first, HIGH second, NORMAL last (within each group: oldest first)
+    priority_rank = {"PINNED": 0, "HIGH": 1, "NORMAL": 2, "": 2}
+    open_items = sorted(open_items, key=lambda f: priority_rank.get(
+        f.get("Priority", "NORMAL").upper(), 2))
+
+    lines = []
+    for item in open_items[-20:]:  # show up to 20 (PINNEDs always visible)
+        cat = item.get("Category", "").upper()
+        text = item.get("Item", "").strip()
+        last = item.get("Last Mentioned", "")
+        added = item.get("Date Added", "")
+        priority = item.get("Priority", "NORMAL").upper()
+        timestamp = last or added
+        badge = " [PINNED]" if priority == "PINNED" else (" [HIGH]" if priority == "HIGH" else "")
+        lines.append(f"  [{cat}]{badge} {text}" + (f" [since {timestamp}]" if timestamp else ""))
+    return "\n".join(lines)
+
+
+def _format_coach_state(coach_state: dict) -> str:
+    """
+    Format the Coach State tab as a compact briefing.
+    This is the coach's own compressed knowledge — one line per domain.
+    Ordered so the most actionable domains appear first.
+    """
+    if not coach_state:
+        return ""
+    domain_order = ["PROGRAM", "SQUAT", "BENCH", "DEADLIFT", "OHP", "HEALTH", "SCHEDULE",
+                    "LIFESTYLE", "GOALS"]
+    lines = []
+    seen = set()
+    for domain in domain_order:
+        if domain in coach_state:
+            entry = coach_state[domain]
+            summary = entry.get("summary", "").strip()
+            confidence = entry.get("confidence", "")
+            updated = entry.get("last_updated", "")
+            if summary:
+                suffix = f" [{confidence}, {updated}]" if confidence and updated else ""
+                lines.append(f"  {domain}: {summary}{suffix}")
+                seen.add(domain)
+    # Any remaining domains not in the ordered list
+    for domain, entry in coach_state.items():
+        if domain not in seen:
+            summary = entry.get("summary", "").strip()
+            if summary:
+                lines.append(f"  {domain}: {summary}")
+    return "\n".join(lines)
+
+
+def _format_athlete_preferences(prefs: list[dict]) -> str:
+    """Format athlete preferences as a compact list for prompt injection."""
+    if not prefs:
+        return ""
+    lines = []
+    for p in prefs:
+        cat = p.get("Category", "").strip()
+        pref = p.get("Preference", "").strip()
+        source = p.get("Source", "").strip()
+        if pref and not pref.startswith("#"):
+            lines.append(f"  [{cat}] {pref}" + (f" (from {source})" if source else ""))
+    return "\n".join(lines)
+
+
 def build_prompt(program_data: dict, memory_data: dict,
                  last_run_date: Optional[date] = None,
                  replies: list[dict] = None,
                  is_weekly_summary: bool = False,
-                 plateau_deep_dives: dict = None) -> tuple[str, str]:
+                 plateau_deep_dives: dict = None,
+                 projections_text: str = "") -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -591,7 +693,8 @@ def build_prompt(program_data: dict, memory_data: dict,
         (system_prompt, user_message)
     """
     today = date.today()
-    week_num = program_data.get("current_week_num", compute_current_week(PROGRAM_START_DATE))
+    _start_date = resolve_program_start_date()
+    week_num = program_data.get("current_week_num", compute_current_week(_start_date))
     progression = program_data.get("progression", {})
     current_week = program_data.get("current_week", {})
     prev_carryover = program_data.get("prev_week_carryover")
@@ -610,23 +713,61 @@ def build_prompt(program_data: dict, memory_data: dict,
 
     # Coaching duration (approximate)
     try:
-        start = datetime.strptime(PROGRAM_START_DATE, "%Y-%m-%d").date()
+        start = datetime.strptime(_start_date, "%Y-%m-%d").date()
         months = (today - start).days // 30
         coaching_duration = f"{months} months" if months >= 1 else "a few weeks"
     except Exception:
         coaching_duration = "several weeks"
 
+    # Program name + total weeks from registry (non-fatal fallback)
+    prog_name = "Strength Program"
+    total_weeks = None
+    try:
+        from memory import get_active_program_info
+        prog_info = get_active_program_info()
+        if prog_info:
+            prog_name = prog_info.get("name") or prog_name
+            tw = prog_info.get("total_weeks")
+            total_weeks = int(tw) if tw else None
+    except Exception:
+        pass
+
     sections = []
 
     # --- Date & week context ---
-    week_label = f"Week {week_num}" + (f"/30, {block_info}" if block_info else "")
+    if total_weeks and block_info:
+        week_label = f"Week {week_num}/{total_weeks}, {block_info}"
+    elif total_weeks:
+        week_label = f"Week {week_num}/{total_weeks}"
+    elif block_info:
+        week_label = f"Week {week_num}, {block_info}"
+    else:
+        week_label = f"Week {week_num}"
     email_type = "WEEKLY SUMMARY (include charts reference)" if is_weekly_summary else "daily email"
     sections.append(
         f"Today: {today.strftime('%A, %B %d, %Y')}\n"
-        f"Program: 30-Week Strength — {week_label}\n"
+        f"Program: {prog_name} — {week_label}\n"
         f"Coaching duration: ~{coaching_duration}\n"
         f"Email type: {email_type}"
     )
+
+    # --- Coach State (your compressed knowledge from last run — read this first) ---
+    coach_state = memory_data.get("coach_state", {})
+    state_text = _format_coach_state(coach_state)
+    if state_text:
+        sections.append(
+            "YOUR CURRENT KNOWLEDGE (Coach State — what you wrote for yourself last run)\n"
+            + state_text
+        )
+
+    # --- Athlete Preferences (respect these before making any output decisions) ---
+    athlete_prefs = memory_data.get("athlete_preferences", [])
+    prefs_text = _format_athlete_preferences(athlete_prefs)
+    if prefs_text:
+        sections.append(
+            "ATHLETE PREFERENCES (explicit feedback — respect these in output decisions)\n"
+            + prefs_text
+        )
 
     # --- Active commands (agent awareness) ---
     commands = memory_data.get("commands", [])
@@ -643,6 +784,15 @@ def build_prompt(program_data: dict, memory_data: dict,
     delta_text = _format_delta(program_data, last_run_date)
     if delta_text:
         sections.append(f"SINCE LAST EMAIL\n{delta_text}")
+
+    # --- Coach's active watch list (what it's tracking, following up on) ---
+    coach_focus = memory_data.get("coach_focus", [])
+    focus_text = _format_coach_focus(coach_focus)
+    if focus_text:
+        sections.append(
+            "YOUR ACTIVE WATCH LIST (what you're currently tracking — check these against today's data)\n"
+            + focus_text
+        )
 
     # --- Questions found in notes (surface early for Claude) ---
     questions = _extract_questions(program_data)
@@ -682,14 +832,20 @@ def build_prompt(program_data: dict, memory_data: dict,
         tg_text = _format_telegram_log(telegram_log)
         sections.append(f"RECENT TELEGRAM CONVERSATION\n{tg_text}")
 
+    # --- Projections (computed facts — not hallucinated) ---
+    if projections_text:
+        sections.append(f"PROJECTIONS (computed — Python math, not estimated)\n{projections_text}")
+
     # --- 1RM trajectory ---
     lift_history = memory_data.get("lift_history", [])
-    one_rm_text = _format_1rm_trajectory(lift_history)
+    tracked_lifts = memory_data.get("tracked_lifts")
+    one_rm_text = _format_1rm_trajectory(lift_history, tracked_lifts=tracked_lifts)
     sections.append(f"ESTIMATED 1RM TRAJECTORY\n{one_rm_text}")
 
     # --- Program trajectory (start → goal vs current) ---
     trajectory = _compute_trajectory(
-        program_data.get("goals", {}), progression, week_num, lift_history
+        program_data.get("goals", {}), progression, week_num, lift_history,
+        tracked_lifts=tracked_lifts
     )
     sections.append(f"PROGRAM TARGETS\n{trajectory}")
 
@@ -739,7 +895,7 @@ def build_prompt(program_data: dict, memory_data: dict,
     if is_weekly_summary:
         user_message += (
             "\n\n---\n\nWrite the weekly summary coaching email. "
-            "This is a Friday recap: cover the full week's performance, key trends, "
+            "This is a Sunday recap: cover the full week's performance, key trends, "
             "and what to focus on next week. Charts for 1RM trajectory and training volume "
             "are attached inline — reference them naturally in the text (e.g. 'as you can see in the chart below')."
         )

@@ -1,7 +1,7 @@
 """
 Strategic planning pass — the coach's long-term brain.
 
-Runs weekly (Fridays) via --think flag. Reads all memory and program data,
+Runs weekly (Sundays) via --think flag. Reads all memory and program data,
 thinks through the next 6-12 months, and writes an updated strategic plan
 to the Coach Memory Sheet (Strategic Plan + Planning Notes tabs).
 
@@ -16,7 +16,7 @@ from typing import Optional
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, ATHLETE_NAME, CLAUDE_MODEL, PROGRAM_START_DATE
+from config import ANTHROPIC_API_KEY, ATHLETE_NAME, CLAUDE_MODEL, resolve_program_start_date
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ def _build_planning_prompt(program_data: dict, memory_data: dict, week_num: int)
     # Current state snapshot
     sections.append(
         f"TODAY: {today.strftime('%A, %B %d, %Y')}\n"
-        f"CURRENT WEEK: Week {week_num} of current program (started {PROGRAM_START_DATE})\n"
+        f"CURRENT WEEK: Week {week_num} of current program (started {resolve_program_start_date()})\n"
         f"ATHLETE: {ATHLETE_NAME}"
     )
 
@@ -71,10 +71,13 @@ def _build_planning_prompt(program_data: dict, memory_data: dict, week_num: int)
     # Current lift trajectory
     lift_history = memory_data.get("lift_history", [])
     if lift_history:
-        # Summarize recent 1RMs for key lifts
-        key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
+        # Summarize recent 1RMs for tracked lifts (MAIN only for planning context)
+        from memory import read_tracked_lifts
+        tracked = memory_data.get("tracked_lifts") or read_tracked_lifts()
+        lifts_for_plan = [(tl["domain"], tl["match_pattern"]) for tl in tracked
+                          if tl.get("lift_type", "MAIN") == "MAIN"]
         lift_lines = []
-        for lift in key_lifts:
+        for _domain, lift in lifts_for_plan:
             readings = []
             for row in lift_history:
                 if lift.lower() in row.get("Exercise", "").lower():
@@ -326,9 +329,9 @@ if __name__ == "__main__":
     print("Loading data for planning pass...")
     from sheets import read_program_data
     from memory import read_all
-    from config import compute_current_week, PROGRAM_START_DATE
+    from config import compute_current_week, resolve_program_start_date as _rsd
 
-    week_num = compute_current_week(PROGRAM_START_DATE)
+    week_num = compute_current_week(_rsd())
     program_data = read_program_data(week_num=week_num)
     memory_data = read_all()
 

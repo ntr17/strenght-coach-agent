@@ -59,10 +59,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Only run on Fridays (day of week = 5)
-          if [ "$(date +%u)" = "5" ]; then
-            echo "Friday — running strategic planning pass..."
+          # Only run on Sundays (day of week = 7, Mon=1 Sun=7)
+          if [ "$(date +%u)" = "7" ]; then
+            echo "Sunday — running strategic planning pass..."
             python src/run_coach.py --think
           else
-            echo "Not Friday — skipping planning pass."
+            echo "Not Sunday — skipping planning pass."
           fi

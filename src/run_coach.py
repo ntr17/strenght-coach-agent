@@ -19,7 +19,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, compute_current_week, PROGRAM_START_DATE
+from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, KEY_LIFTS, compute_current_week, resolve_program_start_date
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--no-sync", action="store_true",
                         help="Skip writing new data to Coach Memory (read-only run)")
     parser.add_argument("--weekly", action="store_true",
-                        help="Force a weekly summary email with charts (normally auto on Fridays)")
+                        help="Force a weekly summary email with charts (normally auto on Sundays)")
     parser.add_argument("--think", action="store_true",
                         help="Run strategic planning pass only — updates Coach Memory, no email sent")
     return parser.parse_args()
@@ -49,24 +49,29 @@ def parse_args():
 
 def generate_analysis(system_prompt: str, user_message: str) -> str:
     """
-    First pass: ask Claude to produce a brief structured analysis before writing.
+    First pass: ask Claude to classify events, check open follow-ups, and set today's agenda.
     This is the 'thinking' step — it doesn't go in the email, it informs it.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     analysis_request = (
-        "Before writing the coaching email, produce a brief structured pre-analysis:\n\n"
-        "OBSERVATIONS: [2-3 key observations from the data]\n"
-        "CONCERNS: [red flags or issues worth addressing — be honest]\n"
-        "QUESTIONS: [topics from athlete notes/replies that need answering]\n"
-        "TRAJECTORY: [brief assessment of progress pace toward goals]\n"
-        "FOCUS: [1-2 things most worth addressing in today's email]\n\n"
-        "Be concise and direct. This is your internal thinking, not the email itself."
+        "Before writing the coaching email, do this structured pre-analysis:\n\n"
+        "EVENT TRIAGE:\n"
+        "- LANDMARK (significant for weeks — PRs, milestones, injuries, major decisions): [list or 'none']\n"
+        "- SIGNAL (pattern worth addressing — recurring behavior, multi-week trend, athlete question): [list or 'none']\n"
+        "- NOISE (one-off disruption — travel miss, minor scheduling — acknowledge briefly, don't dwell): [list or 'none']\n\n"
+        "OPEN FOLLOW-UPS CHECK: [From your watch list — what needs checking today? What might be resolved? What is stale?]\n\n"
+        "WHAT MATTERS TODAY: [1-2 things max — be ruthlessly selective. The athlete's attention is limited.]\n\n"
+        "COACH'S OWN AGENDA: [What will you push today independent of athlete input? Think: ignored trends, "
+        "long-term phase, health factors he's not tracking (sleep, carbs, VO2 max), follow-ups due.]\n\n"
+        "FOCUS UPDATES NEEDED: [Any new items to start tracking? Anything resolved? "
+        "Format: TRACKING/LANDMARK/FOLLOWUP/RESOLVED: description]\n\n"
+        "Be direct and honest. This is your internal thinking only."
     )
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=600,
+        max_tokens=700,
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_message + f"\n\n---\n\n{analysis_request}"}
@@ -119,21 +124,104 @@ def extract_telegram_alert(email_text: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Coach focus markers: parse + write back to Coach Memory
+# ---------------------------------------------------------------------------
+
+def parse_coach_focus_markers(email_text: str) -> tuple[str, list[dict]]:
+    """
+    Extract [TRACKING: ...], [LANDMARK: ...], [FOLLOWUP: ...], [RESOLVED: ...] markers.
+    Returns (clean_email_text, list of {category, item} dicts).
+    Markers are stripped from the email before the athlete sees it.
+    """
+    import re
+    markers = []
+    categories = ["TRACKING", "LANDMARK", "FOLLOWUP", "CONCERN", "RESOLVED"]
+    clean = email_text
+    for cat in categories:
+        pattern = rf'\[{cat}:\s*(.*?)\]'
+        for match in re.finditer(pattern, email_text, re.IGNORECASE | re.DOTALL):
+            markers.append({"category": cat, "item": match.group(1).strip()})
+        clean = re.sub(pattern, '', clean, flags=re.IGNORECASE | re.DOTALL)
+    return clean.strip(), markers
+
+
+def write_coach_focus_updates(updates: list[dict]) -> None:
+    """Write coach focus marker updates to Coach Memory (non-fatal)."""
+    if not updates:
+        return
+    try:
+        from memory import append_coach_focus, update_coach_focus_status
+        today = str(date.today())
+        for u in updates:
+            category = u["category"]
+            item = u["item"]
+            if category == "RESOLVED":
+                found = update_coach_focus_status(item, "RESOLVED", last_mentioned=today)
+                if not found:
+                    print(f"    [Focus] RESOLVED marker didn't match any open item: '{item[:60]}'")
+            else:
+                append_coach_focus(category, item, last_mentioned=today)
+                print(f"    [Focus] {category}: {item[:80]}")
+    except Exception as e:
+        print(f"  Coach focus update failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Weekly recap day — reads from Athlete Preferences, falls back to Sunday
+# ---------------------------------------------------------------------------
+
+_DAY_NAMES = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "lunes": 0, "martes": 1, "miércoles": 2, "miercoles": 2,
+    "jueves": 3, "viernes": 4, "sábado": 5, "sabado": 5, "domingo": 6,
+}
+
+def _get_recap_weekday(athlete_prefs: list[dict]) -> int:
+    """
+    Read the preferred weekly recap day from Athlete Preferences.
+    Looks for a SCHEDULE preference containing 'weekly_recap_day'.
+    Returns weekday int (0=Monday … 6=Sunday). Default: 6 (Sunday).
+    """
+    for pref in athlete_prefs:
+        if pref.get("Category", "").upper() != "SCHEDULE":
+            continue
+        text = pref.get("Preference", "").lower()
+        if "weekly_recap_day" not in text:
+            continue
+        # Expected format: "weekly_recap_day: Sunday" or "weekly recap day: friday"
+        parts = text.split(":")
+        if len(parts) >= 2:
+            day_str = parts[-1].strip()
+            if day_str in _DAY_NAMES:
+                return _DAY_NAMES[day_str]
+    return 6  # default: Sunday
+
+
+# ---------------------------------------------------------------------------
 # Plateau detection: find stalled lifts and run deep dives
 # ---------------------------------------------------------------------------
 
-def detect_plateaus_and_deep_dive(lift_history: list[dict], system_prompt: str) -> dict:
+def detect_plateaus_and_deep_dive(lift_history: list[dict], system_prompt: str,
+                                   tracked_lifts: list[dict] = None) -> dict:
     """
     Check 1RM trajectory for each key lift. If plateaued, fetch full history
     and run a focused analysis. Returns {lift_name: analysis_text}.
+    Only checks MAIN lifts (plateau detection is for primary lifts only).
     """
     from planner import run_lift_deep_dive
     from memory import read_lift_history_for_exercise
 
-    key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
     plateau_dives = {}
 
-    for lift in key_lifts:
+    # Use dynamic tracked lifts (MAIN only), fall back to KEY_LIFTS
+    if tracked_lifts:
+        lifts_to_check = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
+                          if tl.get("lift_type", "MAIN") == "MAIN"]
+    else:
+        lifts_to_check = KEY_LIFTS
+
+    for _domain, lift in lifts_to_check:
         readings = []
         for row in lift_history:
             if lift.lower() not in row.get("Exercise", "").lower():
@@ -162,6 +250,112 @@ def detect_plateaus_and_deep_dive(lift_history: list[dict], system_prompt: str) 
 
 
 # ---------------------------------------------------------------------------
+# Coach State writer — pure Python, no LLM calls
+# ---------------------------------------------------------------------------
+
+def write_coach_state_summaries(
+    memory_data: dict,
+    projections: dict,
+    program_data: dict,
+    week_num: int,
+    dry_run: bool = False,
+) -> None:
+    """
+    Write compressed domain summaries to the Coach State tab.
+    Called at the end of each run so next run starts from a bounded context.
+    Pure Python — uses projection data + program data, no LLM call.
+    """
+    try:
+        from memory import upsert_coach_state
+
+        # --- PROGRAM domain ---
+        prog_proj = projections.get("program_projection")
+        if prog_proj:
+            prog_summary = (
+                f"Week {prog_proj['week_num']}/{prog_proj['total_weeks']} "
+                f"({prog_proj['pct_complete']}% complete, {prog_proj['weeks_remaining']} weeks left, "
+                f"ends {prog_proj['estimated_end_date']})"
+            )
+            _write_state(upsert_coach_state, "PROGRAM", prog_summary, "HIGH", dry_run)
+
+        # --- Lift domains (MAIN lifts from tracked_lifts registry, fallback KEY_LIFTS) ---
+        tracked_lifts = memory_data.get("tracked_lifts")
+        main_lifts = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
+                      if tl.get("lift_type", "MAIN") == "MAIN"] if tracked_lifts else KEY_LIFTS
+        lift_proj_map = {p["exercise"].upper(): p for p in projections.get("lift_projections", []) if p}
+        for domain, lift_name in main_lifts:
+            proj = lift_proj_map.get(domain) or lift_proj_map.get(lift_name.upper())
+            if not proj:
+                continue
+            curr = proj["current_1rm"]
+            rate = proj["rate_per_week"]
+            end_proj = proj.get("projected_end_1rm")
+            on_track = proj.get("on_track")
+            target = proj.get("target_1rm")
+
+            parts = [f"est 1RM {curr}kg", f"trend {rate:+.2f}kg/wk"]
+            if end_proj is not None:
+                parts.append(f"projected end: {end_proj}kg")
+            if target:
+                parts.append(f"target: {target}kg")
+            if on_track is True:
+                parts.append("ON TRACK")
+            elif on_track is False:
+                wtt = proj.get("weeks_to_target")
+                wr = prog_proj["weeks_remaining"] if prog_proj else None
+                if wtt and wr:
+                    parts.append(f"BEHIND ({wtt:.0f}wk needed, {wr}wk left)")
+                else:
+                    parts.append("BEHIND TARGET")
+
+            confidence = "HIGH" if proj.get("data_points", 0) >= 6 else "MEDIUM"
+            _write_state(upsert_coach_state, domain, " | ".join(parts), confidence, dry_run)
+
+        # --- HEALTH domain ---
+        bw_proj = projections.get("bw_projection")
+        health_log = memory_data.get("health_log", [])
+        health_parts = []
+        if bw_proj:
+            health_parts.append(
+                f"BW {bw_proj['current_bw']}kg | trend {bw_proj['rate_per_week']:+.2f}kg/wk "
+                f"({bw_proj['trend_direction']}) | 2wk avg {bw_proj['2wk_avg']}kg"
+            )
+        if health_log:
+            recent = health_log[-14:]
+            sleep_vals = []
+            for e in recent:
+                try:
+                    sleep_vals.append(float(e.get("Sleep (hrs)", "") or ""))
+                except (ValueError, TypeError):
+                    pass
+            if sleep_vals:
+                health_parts.append(f"sleep avg {sum(sleep_vals)/len(sleep_vals):.1f}h (14d)")
+        if health_parts:
+            _write_state(upsert_coach_state, "HEALTH", " | ".join(health_parts),
+                         "HIGH" if bw_proj else "MEDIUM", dry_run)
+
+        # --- SCHEDULE domain ---
+        current_week = program_data.get("current_week", {})
+        sessions = current_week.get("sessions", [])
+        if sessions:
+            done = sum(1 for s in sessions if s.get("completed"))
+            total = len(sessions)
+            sched_summary = f"Week {week_num}: {done}/{total} days completed"
+            _write_state(upsert_coach_state, "SCHEDULE", sched_summary, "HIGH", dry_run)
+
+    except Exception as e:
+        print(f"  Coach State write failed (non-fatal): {e}")
+
+
+def _write_state(fn, domain: str, summary: str, confidence: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"    [DRY RUN] Coach State | {domain}: {summary[:100]}")
+    else:
+        fn(domain, summary, confidence)
+        print(f"    [Coach State] {domain}: {summary[:80]}")
+
+
+# ---------------------------------------------------------------------------
 # Write-back: check if agent wants to propose a program change
 # ---------------------------------------------------------------------------
 
@@ -181,6 +375,33 @@ def check_for_write_back_proposals(email_text: str) -> str:
     return ""
 
 
+def log_pending_proposal(proposal_text: str, existing_commands: list[dict]) -> None:
+    """
+    Log a write-back proposal to the Commands tab so it persists to the next run.
+    Skips if an identical or very similar PENDING_PROPOSAL already exists.
+    """
+    # Check for duplicates — avoid re-logging the same proposal
+    proposal_lower = proposal_text.lower()[:80]
+    for cmd in existing_commands:
+        if cmd.get("Command", "").upper() == "PENDING_PROPOSAL":
+            if cmd.get("Applied", "").upper() != "Y":
+                existing_val = cmd.get("Value", "").lower()[:80]
+                # Simple similarity: if 60%+ of words overlap, treat as duplicate
+                words_new = set(proposal_lower.split())
+                words_old = set(existing_val.split())
+                if words_new and words_old:
+                    overlap = len(words_new & words_old) / len(words_new | words_old)
+                    if overlap > 0.6:
+                        return  # already logged
+
+    try:
+        from memory import append_command
+        append_command("PENDING_PROPOSAL", proposal_text)
+        print(f"    [Proposal logged to Commands]: {proposal_text[:80]}")
+    except Exception as e:
+        print(f"    Proposal logging failed (non-fatal): {e}")
+
+
 # ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
@@ -192,7 +413,7 @@ def run_think(week_num: int = None, dry_run: bool = False):
     from planner import run_planning_pass
 
     if week_num is None:
-        week_num = compute_current_week(PROGRAM_START_DATE)
+        week_num = compute_current_week(resolve_program_start_date())
 
     today = date.today()
     print(f"[{today}] Running strategic planning pass for Week {week_num}...")
@@ -207,13 +428,14 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         force_weekly: bool = False):
     from sheets import read_program_data
     from memory import (read_all, sync_sessions_to_history, sync_health_log,
-                        log_coach_run, get_last_run_date, check_skip_today)
+                        log_coach_run, get_last_run_date, check_skip_today,
+                        expire_stale_focus_items)
     from prompt import build_prompt
     from gmail import read_recent_replies
 
     # Auto-compute week if not overridden
     if week_num is None:
-        week_num = compute_current_week(PROGRAM_START_DATE)
+        week_num = compute_current_week(resolve_program_start_date())
 
     today = date.today()
     print(f"[{today}] Running coach for Week {week_num}...")
@@ -224,32 +446,63 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         print(f"  SKIP_UNTIL command active — no email until {skip_until}. Exiting.")
         return None
 
-    # --- Determine email type ---
-    is_friday = today.weekday() == 4  # 0=Monday, 4=Friday
-    is_weekly_summary = force_weekly or is_friday
-    if is_weekly_summary:
-        print("  Weekly summary mode (Friday or --weekly flag).")
+    # 1. Expire stale Coach Focus items (Priority-aware: PINNED=never, HIGH=90d, NORMAL=30d)
+    try:
+        expired = expire_stale_focus_items()
+        if expired:
+            print(f"  → {expired} stale focus item(s) expired")
+    except Exception as e:
+        print(f"  Stale focus expiry failed (non-fatal): {e}")
 
-    # 1. Read program sheet
+    # 2. Process unprocessed Telegram messages (classify → structured facts → memory)
+    print("  Processing Telegram messages...")
+    try:
+        from processor import process_telegram_messages
+        process_telegram_messages(dry_run=dry_run)
+    except Exception as e:
+        print(f"  Telegram processor failed (non-fatal): {e}")
+
+    # 3. Read program sheet
     print("  Reading program sheet...")
     program_data = read_program_data(week_num=week_num)
 
-    # 2. Read coach memory
+    # 4. Read coach memory
     print("  Reading coach memory...")
     memory_data = read_all()
 
-    # 3. Get last run date for delta detection
+    # --- Determine email type (after memory load so we can read Athlete Preferences) ---
+    # Recap day is read from Athlete Preferences (SCHEDULE | weekly_recap_day: <dayname>)
+    # Falls back to Sunday (weekday 6). Athlete can change this via Telegram.
+    recap_weekday = _get_recap_weekday(memory_data.get("athlete_preferences", []))
+    is_weekly_summary = force_weekly or (today.weekday() == recap_weekday)
+    if is_weekly_summary:
+        day_name = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                    "Friday", "Saturday", "Sunday"][recap_weekday]
+        print(f"  Weekly summary mode ({day_name} or --weekly flag).")
+
+    # 5. Compute projections (pure Python — facts for prompt + Coach State)
+    print("  Computing projections...")
+    try:
+        from projections import run_all_projections
+        projections = run_all_projections(memory_data)
+        if projections.get("formatted"):
+            print(f"    → {projections['formatted'].count(chr(10)) + 1} projection line(s) computed")
+    except Exception as e:
+        print(f"  Projections failed (non-fatal): {e}")
+        projections = {}
+
+    # 5. Get last run date for delta detection
     last_run_date = get_last_run_date()
     if last_run_date:
         print(f"  Last email: {last_run_date} — computing delta...")
 
-    # 4. Read email replies (since last run)
+    # 6. Read email replies (since last run)
     print("  Checking for email replies...")
     replies = read_recent_replies(after_date=last_run_date, max_results=5)
     if replies:
         print(f"    → {len(replies)} reply(ies) found")
 
-    # 5. Sync new data to memory (unless --no-sync)
+    # 7. Sync new data to memory (unless --no-sync)
     if not no_sync:
         print("  Syncing new session data to history...")
         new_sessions = sync_sessions_to_history(program_data)
@@ -261,19 +514,21 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         if new_health:
             print(f"    → {len(new_health)} new health entries logged")
 
-    # 6. Build prompt (initial pass, without plateau dives)
+    # 8. Build prompt (initial pass, without plateau dives)
     print("  Building prompt...")
     system_prompt, user_message = build_prompt(
         program_data, memory_data,
         last_run_date=last_run_date,
         replies=replies,
         is_weekly_summary=is_weekly_summary,
+        projections_text=projections.get("formatted", ""),
     )
 
-    # 7. Plateau detection + per-lift deep dives
+    # 9. Plateau detection + per-lift deep dives
     print("  Checking for plateaus...")
     lift_history = memory_data.get("lift_history", [])
-    plateau_dives = detect_plateaus_and_deep_dive(lift_history, system_prompt)
+    plateau_dives = detect_plateaus_and_deep_dive(
+        lift_history, system_prompt, tracked_lifts=memory_data.get("tracked_lifts"))
     if plateau_dives:
         # Rebuild prompt with deep dive context included
         system_prompt, user_message = build_prompt(
@@ -282,9 +537,10 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
             replies=replies,
             is_weekly_summary=is_weekly_summary,
             plateau_deep_dives=plateau_dives,
+            projections_text=projections.get("formatted", ""),
         )
 
-    # 8. Analysis pass (reasoning before writing)
+    # 10. Analysis pass (reasoning before writing)
     print("  Running analysis pass...")
     analysis = generate_analysis(system_prompt, user_message)
     if dry_run:
@@ -296,25 +552,38 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
     print("  Generating email with Claude...")
     email_text = generate_email(system_prompt, user_message, analysis=analysis)
 
-    # 10. Extract proactive Telegram alert (if coach included one)
+    # 11. Extract output markers (Telegram alert + coach focus updates)
     email_text, tg_alert = extract_telegram_alert(email_text)
     if tg_alert:
         print(f"  [Telegram alert detected]: {tg_alert}")
 
-    # 11. Check for write-back proposals
+    email_text, focus_updates = parse_coach_focus_markers(email_text)
+    if focus_updates:
+        print(f"  [Coach focus updates]: {len(focus_updates)} item(s)")
+        if not no_sync and not dry_run:
+            write_coach_focus_updates(focus_updates)
+        elif dry_run:
+            for u in focus_updates:
+                print(f"    [DRY RUN] {u['category']}: {u['item'][:80]}")
+
+    # 12. Check for write-back proposals — log to Commands so they persist
     proposal = check_for_write_back_proposals(email_text)
     if proposal:
         print(f"\n  [Write-back proposal detected]: {proposal}")
-        print("  → User must confirm via daily notes before any changes are applied.")
+        print("  → Logging to Commands tab — will check for confirmation next run.")
+        if not dry_run and not no_sync:
+            existing_commands = memory_data.get("commands", [])
+            log_pending_proposal(proposal, existing_commands)
 
-    # 12. Generate charts (on Fridays / weekly summary)
+    # 13. Generate charts (on Fridays / weekly summary)
     charts = None
     if is_weekly_summary:
         print("  Generating charts...")
         try:
             from charts import generate_1rm_chart, generate_volume_chart, generate_bodyweight_chart
             chart_list = []
-            c1 = generate_1rm_chart(memory_data.get("lift_history", []))
+            c1 = generate_1rm_chart(memory_data.get("lift_history", []),
+                                    tracked_lifts=memory_data.get("tracked_lifts"))
             if c1:
                 chart_list.append((c1, "chart-1rm"))
             c2 = generate_volume_chart(
@@ -331,7 +600,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         except ImportError:
             print("    → matplotlib not installed, skipping charts")
 
-    # 13. Output
+    # 14. Output
     if dry_run:
         print("\n" + "=" * 60)
         print(f"COACHING EMAIL — {today}")
@@ -363,7 +632,17 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
             except Exception as e:
                 print(f"  Telegram alert failed (non-fatal): {e}")
 
-    # 14. Log the run to Coach Memory
+    # 15. Write Coach State summaries (bounded Tier 1 memory for next run)
+    print("  Writing Coach State summaries...")
+    write_coach_state_summaries(
+        memory_data=memory_data,
+        projections=projections,
+        program_data=program_data,
+        week_num=week_num,
+        dry_run=dry_run or no_sync,
+    )
+
+    # 16. Log the run to Coach Memory
     if not no_sync and not dry_run:
         first_sentence = email_text.split(".")[0].strip()
         log_coach_run(

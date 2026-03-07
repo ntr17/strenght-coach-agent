@@ -124,12 +124,14 @@ def _build_bot_context() -> str:
                 except (ValueError, TypeError):
                     pass
 
-        # Recent 1RM snapshot (last reading per key lift)
+        # Recent 1RM snapshot (last reading per tracked lift)
+        from memory import read_tracked_lifts
+        tracked_lifts = read_tracked_lifts()
         lift_history = read_lift_history(limit=50)
         if lift_history:
-            key_lifts = ["Squat", "Bench Press", "Deadlift", "OHP"]
             lift_lines = []
-            for lift in key_lifts:
+            lifts_for_bot = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts]
+            for _domain, lift in lifts_for_bot:
                 for row in reversed(lift_history):
                     if lift.lower() in row.get("Exercise", "").lower():
                         est = row.get("Est 1RM", "")
@@ -169,6 +171,97 @@ def _generate_response(user_message: str, context: str, model: str) -> str:
         messages=[{"role": "user", "content": full_message}]
     )
     return message.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Confirmation flow for PENDING_PROPOSALs
+# ---------------------------------------------------------------------------
+
+_CONFIRM_WORDS = {"yes", "yep", "yeah", "confirm", "confirmed", "do it", "go ahead",
+                  "sí", "si", "dale", "ok", "okay", "sure"}
+_DECLINE_WORDS = {"no", "nope", "cancel", "reject", "rejected", "don't", "dont",
+                  "stop", "forget it", "never mind", "nevermind"}
+
+
+def _get_pending_proposals() -> list[dict]:
+    """Return unapplied PENDING_PROPOSAL rows from Commands tab."""
+    try:
+        from memory import read_commands
+        return [
+            c for c in read_commands()
+            if c.get("Command", "").upper() == "PENDING_PROPOSAL"
+            and c.get("Applied", "").upper() not in ("Y", "DECLINED")
+        ]
+    except Exception:
+        return []
+
+
+def _resolve_proposal(row_index: int, decision: str, proposal_text: str) -> None:
+    """Mark proposal applied/declined and log to Coach Focus."""
+    try:
+        from memory import mark_command_applied, append_coach_focus
+        if decision == "Y":
+            # mark_command_applied sets Applied = "Y"
+            mark_command_applied(row_index)
+            append_coach_focus("LANDMARK", f"[Confirmed via Telegram] {proposal_text}")
+        else:
+            # Write DECLINED directly
+            from memory import _get_memory_sheet, TAB_COMMANDS, COMMANDS_HEADERS
+            sheet = _get_memory_sheet()
+            ws = sheet.worksheet(TAB_COMMANDS)
+            applied_col = COMMANDS_HEADERS.index("Applied") + 1
+            ws.update_cell(row_index, applied_col, "DECLINED")
+            append_coach_focus("LANDMARK", f"[Declined via Telegram] {proposal_text}")
+    except Exception as e:
+        print(f"[Telegram] Proposal resolution failed (non-fatal): {e}")
+
+
+async def _handle_confirmation(update: Update, user_text: str) -> bool:
+    """
+    Check if the message is a yes/no response to a pending proposal.
+    Returns True if handled (and no further processing needed), False otherwise.
+    """
+    words = set(user_text.lower().split())
+    is_yes = bool(words & _CONFIRM_WORDS)
+    is_no = bool(words & _DECLINE_WORDS)
+
+    if not is_yes and not is_no:
+        return False
+
+    proposals = _get_pending_proposals()
+    if not proposals:
+        return False  # Not a confirmation context — treat as normal message
+
+    if len(proposals) == 1:
+        p = proposals[0]
+        proposal_text = p.get("Value", "")
+        row_index = p.get("_row_index")
+
+        if is_yes:
+            _resolve_proposal(row_index, "Y", proposal_text)
+            reply = (
+                f"Got it — confirmed. I've logged this and will apply it to the program: "
+                f"\"{proposal_text[:120]}\". I'll report in the next email."
+            )
+        else:
+            _resolve_proposal(row_index, "DECLINED", proposal_text)
+            reply = "Understood, I won't make that change."
+
+        await update.message.reply_text(reply)
+        _log_message("OUT", reply)
+        return True
+
+    # Multiple proposals — ask which one
+    proposal_list = "\n".join(
+        f"{i+1}. {p.get('Value', '')[:100]}" for i, p in enumerate(proposals)
+    )
+    reply = (
+        f"I have {len(proposals)} pending proposals. Which one are you confirming?\n\n"
+        f"{proposal_list}\n\nReply with the number."
+    )
+    await update.message.reply_text(reply)
+    _log_message("OUT", reply)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +330,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     _log_message("IN", user_text)
+
+    # Check for yes/no confirmation of a pending proposal before normal routing
+    if await _handle_confirmation(update, user_text):
+        return
 
     # Show typing indicator while generating
     await context.bot.send_chat_action(

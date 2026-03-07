@@ -15,7 +15,7 @@ Tabs:
   Telegram Log      - bidirectional conversation history with athlete
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import gspread
@@ -40,6 +40,10 @@ TAB_COMMANDS = "Commands"
 TAB_STRATEGIC_PLAN = "Strategic Plan"
 TAB_PLANNING_NOTES = "Planning Notes"
 TAB_TELEGRAM_LOG = "Telegram Log"
+TAB_COACH_FOCUS = "Coach Focus"
+TAB_COACH_STATE = "Coach State"
+TAB_ATHLETE_PREFS = "Athlete Preferences"
+TAB_TRACKED_LIFTS = "Tracked Lifts"
 
 LIFT_HISTORY_HEADERS = ["Date", "Week", "Day", "Exercise", "Prescribed Weight",
                          "Actual Weight/Reps", "Completed", "Notes", "Est 1RM"]
@@ -48,11 +52,39 @@ HEALTH_LOG_HEADERS = ["Date", "Bodyweight (kg)", "Steps", "Sleep (hrs)",
 LIFE_CONTEXT_HEADERS = ["Date", "Context"]
 PROGRAM_HISTORY_HEADERS = ["Program", "Start Date", "End Date", "Weeks Completed", "Notes"]
 COACH_LOG_HEADERS = ["Date", "Key Observations", "Email Summary"]
-SHEET_REGISTRY_HEADERS = ["Name", "Sheet ID", "Type", "Status", "Created", "Notes"]
+SHEET_REGISTRY_HEADERS = ["Name", "Sheet ID", "Type", "Status", "Created", "Start Date", "Total Weeks", "Notes"]
 COMMANDS_HEADERS = ["Command", "Value", "Expires", "Applied"]
 STRATEGIC_PLAN_HEADERS = ["Phase", "Start Date", "End Date", "Focus", "Key Targets", "Notes", "Last Updated"]
 PLANNING_NOTES_HEADERS = ["Date", "Notes"]
-TELEGRAM_LOG_HEADERS = ["Date", "Time", "Direction", "Message"]
+TELEGRAM_LOG_HEADERS = ["Date", "Time", "Direction", "Message", "Processed"]
+# Coach's internal tracking list — what it's watching, following up on, or has logged as landmarks
+COACH_FOCUS_HEADERS = ["Date Added", "Category", "Item", "Status", "Last Mentioned", "Priority"]
+# Category values: TRACKING | FOLLOWUP | LANDMARK | CONCERN
+# Status values:   OPEN | RESOLVED | STALE
+# Priority values: NORMAL (expire after 30d) | HIGH (expire after 90d) | PINNED (never expires)
+
+# Coach's compressed knowledge — domain summaries written by the coach each run.
+# PRIMARY prompt input (replaces raw data dump as data grows). One row per domain, upserted.
+COACH_STATE_HEADERS = ["Domain", "Summary", "Confidence", "Last Updated"]
+# Domain examples: SQUAT | BENCH | DEADLIFT | OHP | HEALTH | SCHEDULE | LIFESTYLE | GOALS | PROGRAM
+# Confidence: HIGH | MEDIUM | LOW (based on data recency/completeness)
+
+# Athlete's explicit preferences — how they want the coach to behave.
+# Written by coach when athlete states a preference via any channel.
+ATHLETE_PREFS_HEADERS = ["Category", "Preference", "Source", "Added Date"]
+# Category examples: OUTPUT | TOPICS | STYLE | SCHEDULE
+
+# Tracked lifts — which exercises the coach monitors as key lifts.
+# Replaces the hardcoded KEY_LIFTS list: coach can add/remove lifts dynamically via Telegram.
+TRACKED_LIFTS_HEADERS = ["Name", "Domain", "Match Pattern", "Type", "Active", "Added", "Notes"]
+# Name: display name, e.g. "Squat"
+# Domain: Coach State domain key (uppercase, no spaces), e.g. "SQUAT"
+# Match Pattern: substring matched against "Exercise" column in Lift History (case-insensitive)
+# Type: MAIN | AUXILIARY | ACCESSORY
+#   MAIN      — primary strength lifts (plateau detection, Coach State domain, 1RM tracking)
+#   AUXILIARY — secondary lifts tracked for 1RM but not plateau-detected or Coach State domain
+#   ACCESSORY — logged but not 1RM-tracked or plateau-detected
+# Active: Y | N (N = soft-delete, still in history)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +269,23 @@ def read_commands() -> list[dict]:
     return entries
 
 
+def append_command(command: str, value: str, expires: str = "") -> None:
+    """
+    Append a new command row to the Commands tab.
+    Used to log pending proposals (PENDING_PROPOSAL) and other agent-initiated commands.
+    command: e.g. "PENDING_PROPOSAL", "SKIP_UNTIL"
+    value: the proposal text or command value
+    expires: optional expiry date (YYYY-MM-DD); empty = no expiry
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COMMANDS)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_COMMANDS, rows=200, cols=6)
+        ws.append_row(COMMANDS_HEADERS)
+    ws.append_row([command.upper(), value, expires, "N"])
+
+
 def mark_command_applied(row_index: int) -> None:
     """Mark a command row as applied (sets the Applied column to Y)."""
     sheet = _get_memory_sheet()
@@ -365,7 +414,7 @@ def append_telegram_log(direction: str, message: str,
     now = datetime.now()
     d = str(log_date or now.date())
     t = now.strftime("%H:%M")
-    ws.append_row([d, t, direction.upper(), message])
+    ws.append_row([d, t, direction.upper(), message, "N"])
 
 
 def read_telegram_log(limit: int = 10) -> list[dict]:
@@ -385,6 +434,390 @@ def read_telegram_log(limit: int = 10) -> list[dict]:
             continue
         entries.append(dict(zip(headers, row + [""] * (len(headers) - len(row)))))
     return entries[-limit:]
+
+
+def read_coach_focus(status_filter: str = "OPEN") -> list[dict]:
+    """
+    Read Coach Focus entries. status_filter=None returns all, 'OPEN' returns only active items.
+    Coach Focus is the coach's internal watch list: what it's tracking, following up on, or has logged.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_FOCUS)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        if status_filter is None or entry.get("Status", "OPEN") == status_filter:
+            entries.append(entry)
+    return entries
+
+
+def expire_stale_focus_items() -> int:
+    """
+    Mark OPEN Coach Focus items as STALE based on their Priority:
+      NORMAL  → expire after 30 days
+      HIGH    → expire after 90 days
+      PINNED  → never expires
+    Returns count of items expired.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_FOCUS)
+    except gspread.WorksheetNotFound:
+        return 0
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return 0
+
+    headers = rows[0]
+    date_col = headers.index("Date Added") + 1 if "Date Added" in headers else 1
+    status_col = headers.index("Status") + 1 if "Status" in headers else 4
+    priority_col = headers.index("Priority") + 1 if "Priority" in headers else None
+    today = date.today()
+    expired = 0
+
+    for i, row in enumerate(rows[1:], start=2):
+        if not any(row):
+            continue
+        status = row[status_col - 1].strip().upper() if len(row) >= status_col else ""
+        if status != "OPEN":
+            continue
+
+        priority = ""
+        if priority_col and len(row) >= priority_col:
+            priority = row[priority_col - 1].strip().upper()
+        if not priority:
+            priority = "NORMAL"
+
+        if priority == "PINNED":
+            continue  # never expires
+
+        threshold = 90 if priority == "HIGH" else 30
+        cutoff = today - timedelta(days=threshold)
+
+        date_str = row[date_col - 1].strip() if len(row) >= date_col else ""
+        try:
+            added = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            if added < cutoff:
+                ws.update_cell(i, status_col, "STALE")
+                expired += 1
+        except (ValueError, TypeError):
+            pass
+
+    return expired
+
+
+def append_coach_focus(category: str, item: str,
+                        last_mentioned: str = "",
+                        priority: str = "NORMAL") -> None:
+    """
+    Add a new item to the coach's focus list.
+    category: TRACKING | FOLLOWUP | LANDMARK | CONCERN
+    priority: NORMAL (30d expiry) | HIGH (90d expiry) | PINNED (never expires)
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_FOCUS)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_COACH_FOCUS, rows=500, cols=8)
+        ws.append_row(COACH_FOCUS_HEADERS)
+    today = str(date.today())
+    ws.append_row([today, category.upper(), item, "OPEN",
+                   last_mentioned or today, priority.upper()])
+
+
+def update_coach_focus_status(item_substring: str, new_status: str,
+                               last_mentioned: str = "") -> bool:
+    """
+    Find a Coach Focus item by substring match and update its status.
+    Returns True if found and updated, False otherwise.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_FOCUS)
+    except gspread.WorksheetNotFound:
+        return False
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return False
+    headers = rows[0]
+    item_col = headers.index("Item") + 1 if "Item" in headers else 3
+    status_col = headers.index("Status") + 1 if "Status" in headers else 4
+    last_col = headers.index("Last Mentioned") + 1 if "Last Mentioned" in headers else 5
+
+    needle = item_substring.lower()
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) >= item_col and needle in row[item_col - 1].lower():
+            ws.update_cell(i, status_col, new_status)
+            if last_mentioned:
+                ws.update_cell(i, last_col, last_mentioned)
+            return True
+    return False
+
+
+def read_telegram_unprocessed(limit: int = 50) -> list[dict]:
+    """
+    Return Telegram messages where Processed != 'Y', oldest first.
+    Used by the Telegram Processor to extract structured facts.
+    Each entry includes '_row_index' for marking processed later.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TELEGRAM_LOG)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for i, row in enumerate(rows[1:], start=2):
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        if entry.get("Processed", "N").upper() != "Y":
+            entry["_row_index"] = i
+            entries.append(entry)
+    return entries[-limit:]
+
+
+def mark_telegram_processed(row_indices: list[int]) -> None:
+    """Mark a list of Telegram Log rows (1-indexed) as processed."""
+    if not row_indices:
+        return
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TELEGRAM_LOG)
+    except gspread.WorksheetNotFound:
+        return
+    headers = ws.row_values(1)
+    processed_col = headers.index("Processed") + 1 if "Processed" in headers else 5
+    for idx in row_indices:
+        ws.update_cell(idx, processed_col, "Y")
+
+
+# ---------------------------------------------------------------------------
+# Coach State — compressed domain summaries (Tier 1, primary prompt input)
+# ---------------------------------------------------------------------------
+
+def read_coach_state() -> dict:
+    """
+    Read the Coach State tab. Returns dict keyed by Domain for fast lookup.
+    Example: {"SQUAT": {"summary": "...", "confidence": "HIGH", "last_updated": "2026-03-07"}}
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_STATE)
+    except gspread.WorksheetNotFound:
+        return {}
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return {}
+    headers = rows[0]
+    state = {}
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        domain = entry.get("Domain", "").strip().upper()
+        if domain and not domain.startswith("#"):
+            state[domain] = {
+                "summary": entry.get("Summary", ""),
+                "confidence": entry.get("Confidence", ""),
+                "last_updated": entry.get("Last Updated", ""),
+            }
+    return state
+
+
+def upsert_coach_state(domain: str, summary: str, confidence: str = "MEDIUM") -> None:
+    """
+    Write or update a domain entry in the Coach State tab.
+    Each domain has exactly one row — this upserts by domain name.
+    Called at end of each run to keep state current and bounded.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_COACH_STATE)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_COACH_STATE, rows=100, cols=6)
+        ws.append_row(COACH_STATE_HEADERS)
+
+    today = str(date.today())
+    domain_upper = domain.upper().strip()
+    rows = ws.get_all_values()
+    headers = rows[0] if rows else COACH_STATE_HEADERS
+    domain_col = headers.index("Domain") + 1 if "Domain" in headers else 1
+    summary_col = headers.index("Summary") + 1 if "Summary" in headers else 2
+    confidence_col = headers.index("Confidence") + 1 if "Confidence" in headers else 3
+    updated_col = headers.index("Last Updated") + 1 if "Last Updated" in headers else 4
+
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) >= domain_col and row[domain_col - 1].upper().strip() == domain_upper:
+            ws.update_cell(i, summary_col, summary)
+            ws.update_cell(i, confidence_col, confidence.upper())
+            ws.update_cell(i, updated_col, today)
+            return
+
+    ws.append_row([domain_upper, summary, confidence.upper(), today])
+
+
+# ---------------------------------------------------------------------------
+# Athlete Preferences — explicit behavior flags from athlete feedback
+# ---------------------------------------------------------------------------
+
+def read_athlete_preferences() -> list[dict]:
+    """
+    Read all athlete preferences. Used before any output decision.
+    Returns list of {category, preference, source, added_date}.
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_ATHLETE_PREFS)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        if not entry.get("Preference", "").startswith("#"):
+            entries.append(entry)
+    return entries
+
+
+def append_athlete_preference(category: str, preference: str, source: str = "") -> None:
+    """
+    Record an explicit athlete preference.
+    category: OUTPUT | TOPICS | STYLE | SCHEDULE
+    source: where this came from, e.g. "Telegram 2026-03-07"
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_ATHLETE_PREFS)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=TAB_ATHLETE_PREFS, rows=200, cols=6)
+        ws.append_row(ATHLETE_PREFS_HEADERS)
+    today = str(date.today())
+    ws.append_row([category.upper(), preference, source, today])
+
+
+# ---------------------------------------------------------------------------
+# Tracked Lifts — dynamic key-lift registry (replaces hardcoded KEY_LIFTS)
+# ---------------------------------------------------------------------------
+
+def read_tracked_lifts(active_only: bool = True) -> list[dict]:
+    """
+    Read the Tracked Lifts tab. Falls back to KEY_LIFTS from config if the tab
+    is empty or missing — so the system works on first run without setup.
+
+    Returns list of dicts with keys: name, domain, match_pattern, lift_type, active, added, notes.
+    By default (active_only=True) only returns lifts where Active == 'Y'.
+    """
+    from config import KEY_LIFTS
+
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TRACKED_LIFTS)
+    except gspread.WorksheetNotFound:
+        return _key_lifts_fallback()
+
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return _key_lifts_fallback()
+
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        if entry.get("Name", "").startswith("#"):
+            continue
+        if active_only and entry.get("Active", "Y").upper() != "Y":
+            continue
+        entries.append({
+            "name": entry.get("Name", "").strip(),
+            "domain": entry.get("Domain", "").strip().upper(),
+            "match_pattern": entry.get("Match Pattern", "").strip(),
+            "lift_type": entry.get("Type", "MAIN").strip().upper(),
+            "active": entry.get("Active", "Y").strip().upper(),
+            "added": entry.get("Added", "").strip(),
+            "notes": entry.get("Notes", "").strip(),
+        })
+
+    # Fallback if tab was empty or all rows were comments
+    if not entries:
+        return _key_lifts_fallback()
+    return entries
+
+
+def _key_lifts_fallback() -> list[dict]:
+    """Convert KEY_LIFTS constant into the tracked-lifts dict format."""
+    from config import KEY_LIFTS
+    return [
+        {
+            "name": lift_name,
+            "domain": domain,
+            "match_pattern": lift_name,
+            "lift_type": "MAIN",
+            "active": "Y",
+            "added": "",
+            "notes": "seeded from config.KEY_LIFTS",
+        }
+        for domain, lift_name in KEY_LIFTS
+    ]
+
+
+def add_tracked_lift(name: str, domain: str, match_pattern: str,
+                     lift_type: str = "MAIN", notes: str = "") -> None:
+    """
+    Add a new lift to the Tracked Lifts tab.
+    Creates the tab (with seed data) if it doesn't exist yet.
+    lift_type: MAIN | AUXILIARY | ACCESSORY
+    """
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TRACKED_LIFTS)
+    except gspread.WorksheetNotFound:
+        ws = _create_tracked_lifts_tab(sheet)
+
+    today = str(date.today())
+    ws.append_row([
+        name.strip(),
+        domain.strip().upper(),
+        match_pattern.strip(),
+        lift_type.strip().upper(),
+        "Y",
+        today,
+        notes,
+    ])
+
+
+def _create_tracked_lifts_tab(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Create and seed the Tracked Lifts tab from KEY_LIFTS."""
+    from config import KEY_LIFTS
+    ws = sheet.add_worksheet(title=TAB_TRACKED_LIFTS, rows=200, cols=8)
+    ws.append_row(TRACKED_LIFTS_HEADERS)
+    ws.append_row(["# Lift registry. Type: MAIN|AUXILIARY|ACCESSORY. Active: Y|N.", "", "", "", "", "", ""])
+    today = str(date.today())
+    seed_rows = [
+        [lift_name, domain, lift_name, "MAIN", "Y", today, "seeded from config"]
+        for domain, lift_name in KEY_LIFTS
+    ]
+    ws.append_rows(seed_rows)
+    return ws
 
 
 def read_lift_history_for_exercise(exercise_name: str) -> list[dict]:
@@ -410,10 +843,49 @@ def get_active_program_sheet_id() -> Optional[str]:
     Return the Sheet ID for the currently active Program sheet from the registry.
     Returns None if no active program is registered.
     """
+    info = get_active_program_info()
+    return info.get("sheet_id") if info else None
+
+
+def get_active_program_info() -> Optional[dict]:
+    """
+    Return metadata for the currently active program from the registry.
+    Keys: sheet_id, name, start_date, total_weeks, notes
+    Returns None if no active program is registered.
+    """
     for entry in read_sheet_registry():
         if entry.get("Type") == "Program" and entry.get("Status", "").lower() == "active":
-            return entry.get("Sheet ID", "").strip() or None
+            return {
+                "sheet_id": entry.get("Sheet ID", "").strip() or None,
+                "name": entry.get("Name", "").strip(),
+                "start_date": entry.get("Start Date", "").strip(),
+                "total_weeks": entry.get("Total Weeks", "").strip(),
+                "notes": entry.get("Notes", "").strip(),
+            }
     return None
+
+
+def transition_program(old_sheet_id: str, new_sheet_id: str, new_name: str,
+                        new_start_date: str, total_weeks: str = "",
+                        notes: str = "") -> None:
+    """
+    Archive the current active program and register a new one as active.
+    Called by the coach when transitioning between programs.
+    """
+    sheet = _get_memory_sheet()
+    ws = _get_tab(sheet, TAB_SHEET_REGISTRY)
+    rows = ws.get_all_values()
+
+    # Mark old program as Archive
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) > 1 and row[1].strip() == old_sheet_id:
+            status_col = SHEET_REGISTRY_HEADERS.index("Status") + 1
+            ws.update_cell(i, status_col, "Archive")
+            break
+
+    # Register new program
+    register_sheet(new_name, new_sheet_id, "Program", status="active",
+                   start_date=new_start_date, total_weeks=total_weeks, notes=notes)
 
 
 def get_last_run_date() -> Optional[date]:
@@ -445,6 +917,10 @@ def read_all() -> dict:
         "strategic_plan": read_strategic_plan(),
         "planning_notes": read_planning_notes(),
         "telegram_log": read_telegram_log(),
+        "coach_focus": read_coach_focus(),
+        "coach_state": read_coach_state(),
+        "athlete_preferences": read_athlete_preferences(),
+        "tracked_lifts": read_tracked_lifts(),
     }
 
 
@@ -546,14 +1022,18 @@ def append_health_log(entries: list[dict]) -> None:
 
 
 def register_sheet(name: str, sheet_id: str, sheet_type: str,
-                   status: str = "active", notes: str = "") -> None:
+                   status: str = "active", start_date: str = "",
+                   total_weeks: str = "", notes: str = "") -> None:
     """
     Register a sheet in the Active Sheets registry.
     sheet_type: "Program" | "Auxiliary" | "Archive"
+    start_date: YYYY-MM-DD when the program started (for week computation)
+    total_weeks: how many weeks the program runs (e.g. "30")
     """
     sheet = _get_memory_sheet()
     ws = _get_tab(sheet, TAB_SHEET_REGISTRY)
-    ws.append_row([name, sheet_id, sheet_type, status, str(date.today()), notes])
+    ws.append_row([name, sheet_id, sheet_type, status,
+                   str(date.today()), start_date, str(total_weeks), notes])
 
 
 def create_and_register_sheet(name: str, sheet_type: str,
@@ -754,6 +1234,33 @@ def setup_memory_sheet() -> None:
 
     ensure_tab(TAB_PLANNING_NOTES, PLANNING_NOTES_HEADERS)
     ensure_tab(TAB_TELEGRAM_LOG, TELEGRAM_LOG_HEADERS)
+    ensure_tab(TAB_COACH_FOCUS, COACH_FOCUS_HEADERS, [
+        ["# Coach writes to this automatically. Category: TRACKING|FOLLOWUP|LANDMARK|CONCERN. Status: OPEN|RESOLVED|STALE. Priority: NORMAL|HIGH|PINNED", "", "", "", "", ""],
+    ])
+    ensure_tab(TAB_COACH_STATE, COACH_STATE_HEADERS, [
+        ["# Coach writes domain summaries here each run. One row per domain — upserted automatically.", "", "", ""],
+        ["# Domains: SQUAT | BENCH | DEADLIFT | OHP | HEALTH | SCHEDULE | LIFESTYLE | GOALS | PROGRAM", "", "", ""],
+    ])
+    ensure_tab(TAB_ATHLETE_PREFS, ATHLETE_PREFS_HEADERS, [
+        ["# Explicit preferences from athlete. Category: OUTPUT | TOPICS | STYLE | SCHEDULE", "", "", ""],
+        ["# Examples: OUTPUT | no weekly charts | Telegram | 2026-03-07", "", "", ""],
+    ])
+
+    # Tracked Lifts: seed with current KEY_LIFTS if tab doesn't exist yet
+    from config import KEY_LIFTS
+    if TAB_TRACKED_LIFTS not in existing:
+        ws = sheet.add_worksheet(title=TAB_TRACKED_LIFTS, rows=200, cols=8)
+        ws.append_row(TRACKED_LIFTS_HEADERS)
+        ws.append_row(["# Lift registry. Type: MAIN|AUXILIARY|ACCESSORY. Active: Y|N.", "", "", "", "", "", ""])
+        today = str(date.today())
+        seed_rows = [
+            [lift_name, domain, lift_name, "MAIN", "Y", today, "seeded from config"]
+            for domain, lift_name in KEY_LIFTS
+        ]
+        ws.append_rows(seed_rows)
+        print(f"  Created tab '{TAB_TRACKED_LIFTS}' with {len(seed_rows)} seed lifts.")
+    else:
+        print(f"  Tab '{TAB_TRACKED_LIFTS}' already exists, skipping.")
 
     print("Done. Review and edit the Athlete Profile and Long-Term Goals tabs directly in Google Sheets.")
     print("Remember to register your current program sheet: python src/memory.py --register-program")

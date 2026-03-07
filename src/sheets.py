@@ -15,7 +15,7 @@ import json
 
 from config import (
     CREDENTIALS_FILE, TOKEN_FILE, GOOGLE_SCOPES, GOOGLE_SCOPES_FULL,
-    PROGRAM_SHEET_ID, compute_current_week, PROGRAM_START_DATE
+    PROGRAM_SHEET_ID, compute_current_week, resolve_program_start_date
 )
 
 
@@ -449,7 +449,7 @@ def read_program_data(week_num: Optional[int] = None, lookback: int = 3,
     Returns structured dict with all data the coach needs.
     """
     if week_num is None:
-        week_num = compute_current_week(PROGRAM_START_DATE)
+        week_num = compute_current_week(resolve_program_start_date())
 
     resolved_sheet_id = get_program_sheet_id(sheet_id)
     client = get_client()
