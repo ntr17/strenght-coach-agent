@@ -777,6 +777,49 @@ def _format_athlete_preferences(prefs: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _extract_tone_directives(athlete_prefs: list) -> str:
+    """
+    Scan athlete preferences for tone/style signals and return a directive string.
+    Maps free-form preference text to actionable coaching instructions.
+    """
+    if not athlete_prefs:
+        return ""
+
+    TONE_SIGNALS = {
+        # brevity / conciseness
+        ("shorter", "concise", "brief", "less text", "too long", "tldr", "no fluff"):
+            "Keep this email SHORT — key point + data only. No elaboration.",
+        # more detail
+        ("more detail", "explain more", "why", "deeper", "breakdown", "analysis"):
+            "Go DEEPER than usual — explain the reasoning behind recommendations.",
+        # tougher / more challenging
+        ("push me", "harder", "tougher", "challenge", "don't go easy", "be direct", "no excuses"):
+            "Be DEMANDING. Call out anything below standard. No softening.",
+        # gentler / supportive
+        ("gentler", "supportive", "motivate", "encourage", "positive"):
+            "Lead with encouragement. Acknowledge effort before critique.",
+        # data-focused
+        ("numbers", "data", "stats", "metrics", "just numbers"):
+            "Lead with data — numbers first, interpretation second. Minimize prose.",
+        # less data / more coaching
+        ("less data", "no numbers", "just coach", "feel", "intuitive"):
+            "Minimize raw numbers — focus on what to do and why, not spreadsheet metrics.",
+    }
+
+    pref_text = " ".join(
+        p.get("Preference", "").lower()
+        for p in athlete_prefs
+        if p.get("Category", "").upper() not in ("OUTPUT_CHARTS", "OUTPUT_CHANNEL")
+    )
+
+    directives = []
+    for keywords, directive in TONE_SIGNALS.items():
+        if any(kw in pref_text for kw in keywords):
+            directives.append(f"  • {directive}")
+
+    return "\n".join(directives) if directives else ""
+
+
 def build_prompt(program_data: dict, memory_data: dict,
                  last_run_date: Optional[date] = None,
                  replies: list[dict] = None,
@@ -785,7 +828,8 @@ def build_prompt(program_data: dict, memory_data: dict,
                  projections_text: str = "",
                  program_complete: bool = False,
                  tonnage_by_lift: dict = None,
-                 cross_program: str = "") -> tuple[str, str]:
+                 cross_program: str = "",
+                 goal_proximity: list = None) -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -904,6 +948,14 @@ def build_prompt(program_data: dict, memory_data: dict,
             + prefs_text
         )
 
+    # --- Tone calibration from preferences ---
+    tone_directives = _extract_tone_directives(athlete_prefs)
+    if tone_directives:
+        sections.append(
+            "COACHING TONE FOR THIS EMAIL (derived from athlete feedback — apply immediately)\n"
+            + tone_directives
+        )
+
     # --- Active commands (agent awareness) ---
     commands = memory_data.get("commands", [])
     cmd_text = _format_active_commands(commands)
@@ -1004,6 +1056,25 @@ def build_prompt(program_data: dict, memory_data: dict,
         sections.append(
             "CROSS-PROGRAM PROGRESS (1RM gains: this program vs history — "
             "use for long-term perspective)\n" + cross_program
+        )
+
+    # --- Goal proximity alerts ---
+    if goal_proximity:
+        lines = []
+        for alert in goal_proximity:
+            if alert["urgent"]:
+                lines.append(
+                    f"  🏆 {alert['lift']}: GOAL REACHED — {alert['current_1rm']}kg est. 1RM "
+                    f"(target: {alert['target']}kg). Acknowledge this explicitly. It matters."
+                )
+            else:
+                lines.append(
+                    f"  🎯 {alert['lift']}: {alert['current_1rm']}kg / {alert['target']}kg target — "
+                    f"{alert['gap']}kg away. Closing in. Mention the trajectory."
+                )
+        sections.append(
+            "GOAL PROXIMITY ALERTS (bring these up — athlete is close to or has hit a major target)\n"
+            + "\n".join(lines)
         )
 
     # --- 1RM trajectory ---
@@ -1113,11 +1184,17 @@ def build_proactive_prompt(memory_data: dict, program_data: dict = None) -> tupl
         "→ check in on whether it happened or needs adjusting.\n"
         "5. GENERAL CHECK-IN: If you haven't heard from the athlete in 2+ days and no known break "
         "→ brief check-in. Don't do this if you already sent a message today.\n\n"
+        "6. DELOAD SIGNAL: If Coach State shows TSB is negative and deload_recommended is flagged "
+        "→ message the athlete directly: 'Fatigue is building. I want us to dial this week back.' "
+        "Reference the actual TSB number from the projections if available.\n"
+        "7. GOAL PROXIMITY: If Coach State shows a lift within 5kg of its target "
+        "→ mention it with energy. 'You're Xkg away from your squat goal — this week matters.'\n\n"
         "Output rules:\n"
         "- [TELEGRAM: your message] — 1-3 sentences, direct, natural coach voice, not pushy\n"
         "- [PASS: reason] — if no outreach needed right now\n"
         "- You may also include [FOLLOWUP: ...] or [TRACKING: ...] to update your watch list\n\n"
-        "Don't reach out if you already sent a Telegram message in the last few hours. "
+        "Bias toward sending, not passing. A good coach reaches out. A bad one waits. "
+        "Don't reach out if you already sent a Telegram message in the last 4 hours. "
         "Don't repeat what was said in the last email unless it's genuinely relevant right now."
     )
 

@@ -502,12 +502,16 @@ def _tool_list_programs() -> str:
 
 
 def _tool_get_projections() -> str:
-    """Return computed projections from the projection engine."""
+    """Return computed projections (includes fatigue model ATL/CTL/TSB + tonnage)."""
     try:
         from memory import read_all
         from projections import run_all_projections
+        from sheets import read_program_data
+        from config import compute_current_week, resolve_program_start_date
         memory_data = read_all()
-        result = run_all_projections(memory_data)
+        week_num = compute_current_week(resolve_program_start_date())
+        program_data = read_program_data(week_num=week_num, lookback=4)
+        result = run_all_projections(memory_data, program_data=program_data)
         return result.get("formatted") or "Insufficient data for projections."
     except Exception as e:
         return f"Could not compute projections: {e}"
@@ -1155,6 +1159,17 @@ async def handle_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     _log_message("OUT", f"[week schedule, {done}/{total} done]")
 
 
+async def handle_compare(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show cross-program 1RM comparison (/compare)."""
+    if not _is_authorized(update):
+        return
+    await update.message.reply_text("Comparing across programs...")
+    result = _tool_get_program_comparison()
+    await update.message.reply_text(result[:4000])
+    _log_message("IN", "/compare")
+    _log_message("OUT", "[cross-program comparison]")
+
+
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a progress chart. Usage: /chart [1rm|bodyweight|volume]"""
     if not _is_authorized(update):
@@ -1630,6 +1645,7 @@ def main() -> None:
     app.add_handler(CommandHandler("summary", handle_summary))
     app.add_handler(CommandHandler("week", handle_week))
     app.add_handler(CommandHandler("chart", handle_chart))
+    app.add_handler(CommandHandler("compare", handle_compare))
     app.add_handler(CommandHandler("data", handle_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))

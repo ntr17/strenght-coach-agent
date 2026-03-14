@@ -790,6 +790,13 @@ def run_all_projections(
     except Exception:
         pass
 
+    # Goal proximity alerts (within 5kg of target 1RM)
+    goal_proximity = []
+    try:
+        goal_proximity = detect_goal_proximity(lift_projections)
+    except Exception:
+        pass
+
     formatted = format_projections_for_prompt(lift_projections, bw_proj, program_proj, fatigue)
 
     return {
@@ -800,8 +807,35 @@ def run_all_projections(
         "tonnage_by_lift": tonnage_by_lift,
         "volume_spikes": volume_spikes,
         "cross_program": cross_program,
+        "goal_proximity": goal_proximity,
         "formatted": formatted,
     }
+
+
+def detect_goal_proximity(lift_projections: list, threshold_kg: float = 5.0) -> list:
+    """
+    Return a list of {lift, current_1rm, target, gap, urgent} dicts for lifts
+    within threshold_kg of their target 1RM.
+
+    urgent=True when current_1rm >= target (goal reached or exceeded).
+    urgent=False when within threshold but not yet there.
+    """
+    alerts = []
+    for proj in lift_projections:
+        if not proj or not proj.get("target_1rm"):
+            continue
+        current = proj.get("current_1rm", 0.0)
+        target = proj["target_1rm"]
+        gap = target - current
+        if abs(gap) <= threshold_kg:
+            alerts.append({
+                "lift": proj["exercise"],
+                "current_1rm": current,
+                "target": target,
+                "gap": round(gap, 1),
+                "urgent": gap <= 0,  # at or past goal
+            })
+    return alerts
 
 
 def _parse_lift_targets(goals_text: str) -> dict:

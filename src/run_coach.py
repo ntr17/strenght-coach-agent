@@ -43,6 +43,10 @@ def parse_args():
                         help="Run strategic planning pass only — updates Coach Memory, no email sent")
     parser.add_argument("--proactive", action="store_true",
                         help="Lightweight check-in: read memory, reason, optionally send Telegram. No email.")
+    parser.add_argument("--nudge", action="store_true",
+                        help="Evening nudge: if today's session is unlogged, send a Telegram reminder.")
+    parser.add_argument("--export", action="store_true",
+                        help="Export all Coach Memory tabs to JSON (stdout or file).")
     return parser.parse_args()
 
 
@@ -689,6 +693,62 @@ def run_proactive(dry_run: bool = False):
         print(f"  HealthAgent proactive failed (non-fatal): {e}")
 
 
+def _send_weekly_digest(memory_data: dict, program_data: dict,
+                        projections: dict, week_num: int) -> None:
+    """
+    Push a compact weekly digest to Telegram after the Sunday email.
+    Key numbers only — no coaching prose. Athlete can read the email for the full story.
+    """
+    from telegram_utils import send_telegram_message
+
+    lines = [f"📊 Week {week_num} digest:"]
+
+    # Session completion
+    current_week = program_data.get("current_week", {})
+    sessions = current_week.get("sessions", [])
+    if sessions:
+        done = sum(1 for s in sessions if s.get("completed"))
+        lines.append(f"  Sessions: {done}/{len(sessions)} completed")
+
+    # Est 1RM per main lift
+    lift_projs = projections.get("lift_projections", [])
+    if lift_projs:
+        for p in lift_projs:
+            if p and p.get("current_1rm"):
+                rate_str = f"{p['rate_per_week']:+.1f}kg/wk" if p.get("rate_per_week") is not None else ""
+                track = " ✓" if p.get("on_track") else (" ✗" if p.get("on_track") is False else "")
+                lines.append(f"  {p['exercise']}: {p['current_1rm']}kg est. 1RM {rate_str}{track}")
+
+    # Fatigue
+    fatigue = projections.get("fatigue")
+    if fatigue:
+        flag = " ⚠ deload needed" if fatigue.get("deload_recommended") else ""
+        lines.append(f"  Fatigue TSB: {fatigue['TSB']:+.1f} ({fatigue['readiness'].split(' — ')[0]}){flag}")
+
+    # Bodyweight from health log
+    health_log = memory_data.get("health_log", [])
+    bw_entries = [e for e in health_log if e.get("Bodyweight (kg)")]
+    if bw_entries:
+        try:
+            latest_bw = float(bw_entries[-1]["Bodyweight (kg)"])
+            lines.append(f"  Bodyweight: {latest_bw}kg")
+        except (ValueError, TypeError):
+            pass
+
+    # Goal proximity
+    gp = projections.get("goal_proximity", [])
+    for alert in gp:
+        if alert["urgent"]:
+            lines.append(f"  🏆 {alert['lift']} goal REACHED ({alert['current_1rm']}kg)")
+        else:
+            lines.append(f"  🎯 {alert['lift']} {alert['gap']}kg from goal")
+
+    msg = "\n".join(lines)
+    sent = send_telegram_message(msg)
+    if sent:
+        print(f"  Weekly Telegram digest sent ({len(lines)} lines)")
+
+
 def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         force_weekly: bool = False):
     from sheets import read_program_data
@@ -780,23 +840,36 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
                 if "volume spike" not in " ".join(open_items_text):
                     append_coach_focus("CONCERN", note, priority="HIGH", last_mentioned=str(today))
                     print(f"    [Volume spike] {note[:80]}")
-        # Deload auto-detection
+        # Deload auto-detection + smart proposal
         fatigue = projections.get("fatigue")
         if fatigue and fatigue.get("deload_recommended") and not dry_run and not no_sync:
             from memory import append_coach_focus
-            deload_note = (f"TSB={fatigue['TSB']:+.1f} — {fatigue['readiness']}. "
-                           "Consider a deload week this cycle.")
+            deload_note = (f"TSB={fatigue['TSB']:+.1f} (ATL={fatigue['ATL']:.1f} CTL={fatigue['CTL']:.1f}) "
+                           f"— {fatigue['readiness']}. Accumulated fatigue exceeds fitness buffer.")
             print(f"    [Deload signal] {deload_note}")
-            try:
-                from telegram_utils import send_telegram_message
-                send_telegram_message(f"Recovery check: {deload_note}")
-            except Exception:
-                pass
             existing_focus = memory_data.get("coach_focus", [])
             open_items_text = [f.get("Item", "").lower() for f in existing_focus
                                if f.get("Status", "OPEN") == "OPEN"]
             if "deload" not in " ".join(open_items_text):
                 append_coach_focus("CONCERN", deload_note, priority="HIGH", last_mentioned=str(today))
+            # Auto-draft a deload proposal and log as PENDING_PROPOSAL
+            existing_commands = memory_data.get("commands", [])
+            deload_proposal = (
+                f"Deload week proposal (auto-triggered by fatigue model): "
+                f"Reduce all working sets to 60% of current load, cut total volume by 40%, "
+                f"maintain movement patterns. TSB={fatigue['TSB']:+.1f} indicates accumulated "
+                f"fatigue — a 5-7 day recovery week will restore readiness before the next block. "
+                f"Want me to adjust the program sheet for this week?"
+            )
+            log_pending_proposal(deload_proposal, existing_commands)
+            try:
+                from telegram_utils import send_telegram_message
+                send_telegram_message(
+                    f"⚠️ Fatigue alert: TSB={fatigue['TSB']:+.1f} ({fatigue['readiness']}). "
+                    f"I've drafted a deload week proposal — reply 'yes' to apply it, or we'll discuss in tonight's email."
+                )
+            except Exception:
+                pass
     except Exception as e:
         print(f"  Projections failed (non-fatal): {e}")
         projections = {}
@@ -840,6 +913,33 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
     # 8b. Build prompt (initial pass, without plateau dives)
     print("  Building prompt...")
+    # Goal proximity alerting (within 5kg of a target → landmark + Telegram)
+    goal_proximity = projections.get("goal_proximity", [])
+    if goal_proximity and not dry_run and not no_sync:
+        from memory import append_coach_focus
+        try:
+            from telegram_utils import send_telegram_message
+        except Exception:
+            send_telegram_message = None
+        existing_focus = memory_data.get("coach_focus", [])
+        open_items_text = [f.get("Item", "").lower() for f in existing_focus
+                           if f.get("Status", "OPEN") == "OPEN"]
+        for alert in goal_proximity:
+            lift = alert["lift"]
+            if alert["urgent"]:
+                msg = (f"🏆 {lift} GOAL REACHED: {alert['current_1rm']}kg est. 1RM "
+                       f"(target was {alert['target']}kg) — milestone achieved!")
+                focus_cat = "LANDMARK"
+            else:
+                msg = (f"🎯 {lift} closing in on goal: {alert['current_1rm']}kg / {alert['target']}kg target "
+                       f"— {alert['gap']}kg to go")
+                focus_cat = "TRACKING"
+            if lift.lower() not in " ".join(open_items_text) or alert["urgent"]:
+                append_coach_focus(focus_cat, msg, priority="HIGH", last_mentioned=str(today))
+                print(f"    [Goal proximity] {msg}")
+            if alert["urgent"] and send_telegram_message:
+                send_telegram_message(msg)
+
     _prompt_kwargs = dict(
         last_run_date=last_run_date,
         replies=replies,
@@ -848,10 +948,11 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         program_complete=program_complete,
         tonnage_by_lift=projections.get("tonnage_by_lift"),
         cross_program=projections.get("cross_program", ""),
+        goal_proximity=goal_proximity,
     )
     system_prompt, user_message = build_prompt(program_data, memory_data, **_prompt_kwargs)
 
-    # 9. Plateau detection + per-lift deep dives
+    # 9. Plateau detection + per-lift deep dives + auto-intervention
     print("  Checking for plateaus...")
     lift_history = memory_data.get("lift_history", [])
     plateau_dives = detect_plateaus_and_deep_dive(
@@ -862,6 +963,28 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
             program_data, memory_data,
             **{**_prompt_kwargs, "plateau_deep_dives": plateau_dives},
         )
+        # Auto-intervention: log PENDING_PROPOSAL for each plateaued lift
+        # so the coach has a concrete action item rather than just awareness
+        if not dry_run and not no_sync:
+            existing_commands = memory_data.get("commands", [])
+            existing_focus = memory_data.get("coach_focus", [])
+            open_proposal_text = " ".join(
+                c.get("Value", "").lower() for c in existing_commands
+                if c.get("Command", "").upper() == "PENDING_PROPOSAL"
+                and c.get("Applied", "").upper() not in ("Y", "DECLINED")
+            )
+            for lift_name, analysis_text in plateau_dives.items():
+                if lift_name.lower() in open_proposal_text:
+                    print(f"    [Plateau] Proposal already pending for {lift_name} — skipping")
+                    continue
+                proposal = (
+                    f"Plateau intervention for {lift_name}: "
+                    f"lift has stalled for 3+ weeks. Proposed fix based on deep-dive analysis: "
+                    f"{analysis_text[:200].strip()} "
+                    f"— want me to apply a loading/technique change to the program sheet?"
+                )
+                log_pending_proposal(proposal, existing_commands)
+                print(f"    [Plateau intervention] Auto-proposal logged for {lift_name}")
 
     # 9b. Outcome learning loop: detect easy/hard difficulty patterns per lift
     print("  Running outcome learning loop...")
@@ -1006,6 +1129,18 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
             except Exception as e:
                 print(f"  Telegram alert failed (non-fatal): {e}")
 
+        # Weekly Sunday digest: push key numbers to Telegram
+        if is_weekly_summary:
+            try:
+                _send_weekly_digest(
+                    memory_data=memory_data,
+                    program_data=program_data,
+                    projections=projections,
+                    week_num=week_num,
+                )
+            except Exception as e:
+                print(f"  Weekly Telegram digest failed (non-fatal): {e}")
+
     # 15. Write Coach State summaries (bounded Tier 1 memory for next run)
     print("  Writing Coach State summaries...")
     write_coach_state_summaries(
@@ -1043,6 +1178,127 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
 
 # ---------------------------------------------------------------------------
+# Session completion nudge
+# ---------------------------------------------------------------------------
+
+def run_nudge(dry_run: bool = False):
+    """
+    Evening check: look at today's program, see if any sessions are unlogged.
+    If they are and it's past 19:00 UTC (20:00 Spain), send a gentle Telegram push.
+    Skips if a session was already completed or if Telegram was already sent today.
+    """
+    from sheets import read_program_data
+    from memory import read_coach_state, upsert_coach_state
+
+    today = date.today()
+    week_num = compute_current_week(resolve_program_start_date())
+    print(f"[{today}] Running session nudge check (Week {week_num})...")
+
+    try:
+        program_data = read_program_data(week_num=week_num, lookback=0)
+    except Exception as e:
+        print(f"  Nudge: program load failed: {e}")
+        return
+
+    current_week = program_data.get("current_week", {})
+    today_str = today.strftime("%A")  # e.g. "Monday"
+    today_sessions = []
+    for day in current_week.get("days", []):
+        day_label = day.get("label", "")
+        # Match sessions scheduled for today (rough day-of-week match)
+        if today_str.lower() in day_label.lower():
+            today_sessions.append(day)
+
+    if not today_sessions:
+        print("  Nudge: no session scheduled today — skipping.")
+        return
+
+    # Check if any session is incomplete (no done=True exercises)
+    any_complete = False
+    for day in today_sessions:
+        done_count = sum(1 for ex in day.get("exercises", []) if ex.get("done"))
+        if done_count > 0:
+            any_complete = True
+            break
+
+    if any_complete:
+        print("  Nudge: session already logged today — skipping.")
+        return
+
+    # Dedup: check if we already sent a nudge today
+    coach_state = read_coach_state()
+    last_nudge = coach_state.get("LAST_NUDGE", {}).get("summary", "")
+    if last_nudge == str(today):
+        print(f"  Nudge: already sent today ({today}) — skipping.")
+        return
+
+    # Build nudge message
+    session_labels = [day.get("label", "session") for day in today_sessions]
+    session_str = " + ".join(session_labels)
+    nudge_msg = (
+        f"Hey — {session_str} is still unlogged. "
+        f"Did you train today? If yes, just tell me what you did. "
+        f"If you skipped, that's fine — just let me know so I can track it."
+    )
+
+    if dry_run:
+        print(f"  [DRY RUN] Would send nudge: {nudge_msg}")
+        return
+
+    try:
+        from telegram_utils import send_telegram_message
+        sent = send_telegram_message(nudge_msg)
+        if sent:
+            print(f"  Nudge sent: {nudge_msg[:80]}")
+            upsert_coach_state("LAST_NUDGE", str(today), "HIGH")
+    except Exception as e:
+        print(f"  Nudge send failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Data export
+# ---------------------------------------------------------------------------
+
+def run_export(output_file: str = None, dry_run: bool = False):
+    """
+    Export all Coach Memory tabs to JSON.
+    Writes to output_file if provided, otherwise prints to stdout.
+    Safe read-only operation — no writes to sheets.
+    """
+    import json
+    from memory import read_all, read_lift_history, read_health_log, read_telegram_log
+
+    today = date.today()
+    print(f"[{today}] Exporting Coach Memory...")
+
+    # Tier 1 + Tier 0 combined
+    data = read_all()
+    data["lift_history_full"] = read_lift_history(limit=1000)
+    data["health_log_full"] = read_health_log(limit=365)
+    data["telegram_log_full"] = read_telegram_log(limit=500)
+
+    export = {
+        "exported_at": str(today),
+        "data": {k: v for k, v in data.items()},
+    }
+
+    json_str = json.dumps(export, indent=2, default=str)
+
+    if dry_run or not output_file:
+        print(f"Export: {len(json_str)} bytes | {sum(len(v) if isinstance(v, list) else 1 for v in data.values())} records")
+        if output_file:
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(json_str)
+            print(f"  Exported to: {output_file}")
+        else:
+            print(json_str[:2000] + ("..." if len(json_str) > 2000 else ""))
+    else:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(json_str)
+        print(f"  Exported {len(json_str)} bytes → {output_file}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1062,6 +1318,12 @@ if __name__ == "__main__":
             run_think(week_num=week_num, dry_run=args.dry_run)
         elif args.proactive:
             run_proactive(dry_run=args.dry_run)
+        elif args.nudge:
+            run_nudge(dry_run=args.dry_run)
+        elif args.export:
+            from datetime import datetime as _dt
+            fname = f"coach_export_{_dt.today().strftime('%Y%m%d')}.json"
+            run_export(output_file=fname, dry_run=args.dry_run)
         else:
             run(
                 week_num=week_num,

@@ -36,9 +36,13 @@ CATEGORIES:
                      "contact me by email", etc. — format as: "primary_channel: telegram" or "primary_channel: email"
 - WORKOUT_UNPLANNED — unplanned/spontaneous session not on the program
 - LIFT_UPDATE      — athlete reports a specific weight, set, PR, or performance.
-                     FACT format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <ISO or 'unknown'>"
-                     Include as many fields as can be extracted. Always extract date if mentioned (yesterday, last Tuesday, etc.)
-                     Example: "exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-11"
+                     FACT format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <ISO or 'unknown'> | rpe: <N> | rir: <N>"
+                     Include as many fields as can be extracted. RPE (Rate of Perceived Exertion, 1-10) and RIR (Reps in Reserve)
+                     are optional — only include if explicitly mentioned. Always extract date if mentioned.
+                     Examples:
+                       "exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-11"
+                       "exercise: Bench Press | weight: 90 | sets_reps: 4x5 | date: 2026-03-11 | rpe: 8"
+                       "exercise: Deadlift | weight: 150 | sets_reps: 1x5 | date: unknown | rir: 2"
 - MOOD_PERFORMANCE — qualitative notes about how a session felt, energy level during training, pain/discomfort
                      during specific exercises, RPE estimates, mental state. Capture anything that affects
                      how we interpret lift numbers. NOT pure health metrics (those are HEALTH_DATA).
@@ -82,7 +86,8 @@ PREFERENCE | 2026-03-06 | Athlete says weekly charts are not useful, prefers tex
 PREFERENCE | 2026-03-06 | primary_channel: telegram
 PREFERENCE | 2026-03-06 | primary_channel: email
 WORKOUT_UNPLANNED | 2026-03-05 | Athlete did spontaneous pull day with pull-ups and rows
-LIFT_UPDATE | 2026-03-07 | exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-07
+LIFT_UPDATE | 2026-03-07 | exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-07 | rpe: 8
+LIFT_UPDATE | 2026-03-07 | exercise: Bench Press | weight: 87.5 | sets_reps: 4x5 | date: 2026-03-07 | rir: 2
 MOOD_PERFORMANCE | 2026-03-07 | Squats felt slow and heavy, energy low, stopped at set 3
 MOOD_PERFORMANCE | 2026-03-09 | Sharp elbow pain on last bench set, stopped early
 MOOD_PERFORMANCE | 2026-03-11 | Best session in weeks, everything moved fast, RPE 8
@@ -374,6 +379,8 @@ def _parse_lift_update_fact(fact: str, today: str) -> dict | None:
     weight = fields.get("weight", "").strip()
     sets_reps = fields.get("sets_reps", "").strip()
     date_raw = fields.get("date", "unknown").strip()
+    rpe_raw = fields.get("rpe", "").strip()
+    rir_raw = fields.get("rir", "").strip()
 
     # Need at least exercise + weight to be worth logging
     if not exercise or not weight:
@@ -388,6 +395,18 @@ def _parse_lift_update_fact(fact: str, today: str) -> dict | None:
     if sets_reps:
         actual_str += f" {sets_reps}"
 
+    # Build notes with RPE/RIR if provided
+    notes_parts = [f"[Logged via Telegram on {today}]"]
+    if rpe_raw:
+        rpe_clean = _re.sub(r"[^\d.]", "", rpe_raw)
+        if rpe_clean:
+            notes_parts.append(f"RPE {rpe_clean}")
+            actual_str += f" @RPE{rpe_clean}"
+    if rir_raw:
+        rir_clean = _re.sub(r"[^\d.]", "", rir_raw)
+        if rir_clean:
+            notes_parts.append(f"RIR {rir_clean}")
+
     normalized_date = _normalize_date(date_raw, today)
 
     return {
@@ -397,7 +416,7 @@ def _parse_lift_update_fact(fact: str, today: str) -> dict | None:
         "prescribed_weight": weight_clean,
         "sets_reps": sets_reps,
         "completed": True,
-        "notes": f"[Logged via Telegram on {today}]",
+        "notes": " | ".join(notes_parts),
         "week": "",
         "day_label": "Telegram",
     }
