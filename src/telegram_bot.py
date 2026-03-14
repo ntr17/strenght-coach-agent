@@ -128,19 +128,29 @@ def _build_bot_context() -> str:
         if goals:
             sections.append(f"LONG-TERM GOALS\n{goals.strip()}")
 
-        # --- Lift levels (last known 1RM per tracked lift) ---
+        # --- Lift levels (best 1RM per tracked lift, word-boundary match) ---
+        import re as _re
         tracked_lifts = read_tracked_lifts()
         lift_history = read_lift_history(limit=60)
         if lift_history:
             lift_lines = []
             for tl in tracked_lifts:
                 lift = tl["match_pattern"]
-                for row in reversed(lift_history):
-                    if lift.lower() in row.get("Exercise", "").lower():
-                        est = row.get("Est 1RM", "")
-                        if est:
-                            lift_lines.append(f"  {lift}: {est}kg est. 1RM [{row.get('Date', '?')}]")
-                            break
+                pattern = _re.compile(r"(?i)^" + _re.escape(lift) + r"(\s|$|\()")
+                best_est = None
+                for row in lift_history:
+                    if not pattern.match(row.get("Exercise", "").strip()):
+                        continue
+                    est = row.get("Est 1RM", "")
+                    if est:
+                        try:
+                            v = float(est)
+                            if best_est is None or v > best_est[0]:
+                                best_est = (v, row.get("Date", "?"))
+                        except ValueError:
+                            pass
+                if best_est:
+                    lift_lines.append(f"  {lift}: {best_est[0]}kg est. 1RM [{best_est[1]}]")
             if lift_lines:
                 sections.append("CURRENT LIFT LEVELS\n" + "\n".join(lift_lines))
 
