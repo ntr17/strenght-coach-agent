@@ -33,6 +33,10 @@ CATEGORIES:
 - LIFT_UPDATE      — athlete reports a specific weight, set, PR, or performance
 - TRACK_LIFT       — athlete wants to add or remove a lift as a tracked main/auxiliary lift
                      (phrases like "track X", "add X as main lift", "start monitoring X", "drop X from main lifts")
+- HEALTH_DATA      — athlete reports health metrics: lab values (blood test, ferritin, TSH, glucose, etc.),
+                     HRV, bodyweight, sleep hours, energy level, food quality, steps, resting HR, watch data,
+                     nutrition logs. The FACT should preserve all numeric values verbatim.
+                     Examples: "ferritin: 45 ng/mL, TSH: 2.1", "HRV 58, resting HR 52", "slept 7.5h, energy 8/10"
 - QUESTION         — athlete has a question or wants advice on something specific
 - NOISE            — chitchat, acknowledgment, emoji-only, irrelevant
 
@@ -54,6 +58,9 @@ WORKOUT_UNPLANNED | 2026-03-05 | Athlete did spontaneous pull day with pull-ups 
 LIFT_UPDATE | 2026-03-07 | Athlete hit 100kg squat x3 in an unplanned session
 TRACK_LIFT | 2026-03-07 | Athlete wants to track Romanian Deadlift as a main lift
 TRACK_LIFT | 2026-03-07 | Athlete wants to remove Dip from tracked lifts
+HEALTH_DATA | 2026-03-07 | ferritin: 45 ng/mL, TSH: 2.1 mU/L, glucose: 95 mg/dL
+HEALTH_DATA | 2026-03-07 | HRV: 58ms, resting HR: 52bpm, sleep: 7.5h
+HEALTH_DATA | 2026-03-07 | bodyweight: 83.2kg, food quality: 8/10, energy: 7/10
 QUESTION | 2026-03-07 | Athlete asks whether to add calories on training days
 """
 
@@ -81,7 +88,8 @@ def _parse_processor_output(output: str) -> list[dict]:
 
         valid_categories = {
             "SCHEDULE_CHANGE", "LIFE_EVENT", "PREFERENCE",
-            "WORKOUT_UNPLANNED", "LIFT_UPDATE", "TRACK_LIFT", "QUESTION", "NOISE",
+            "WORKOUT_UNPLANNED", "LIFT_UPDATE", "TRACK_LIFT",
+            "HEALTH_DATA", "QUESTION", "NOISE",
         }
         if category not in valid_categories:
             continue
@@ -168,6 +176,20 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
                 )
                 dispatched += 1
 
+            elif cat == "HEALTH_DATA":
+                # Extract any known standard fields (BW, sleep, food quality, HRV)
+                # and store everything as a health log entry with raw data in Notes.
+                from memory import append_health_log
+                entry = _parse_health_data_fact(fact, event_date if event_date != "unknown" else today)
+                append_health_log([entry])
+                # Also surface in Coach Focus so the coach notices new data is available
+                append_coach_focus(
+                    "TRACKING",
+                    f"[Health data logged via Telegram] {fact[:100]}",
+                    last_mentioned=today,
+                )
+                dispatched += 1
+
             elif cat == "QUESTION":
                 # Open question — track as FOLLOWUP so coach addresses it
                 append_coach_focus("FOLLOWUP", f"[Athlete question] {fact}", last_mentioned=today)
@@ -181,6 +203,48 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
             print(f"    [Processor] Dispatch failed for {cat}: {exc}")
 
     return dispatched
+
+
+def _parse_health_data_fact(fact: str, entry_date: str) -> dict:
+    """
+    Parse a HEALTH_DATA fact string into a health log entry dict.
+    Extracts standard fields (BW, sleep, food quality) if present.
+    Everything is also stored verbatim in Notes for the HealthAgent to read.
+
+    Known patterns (case-insensitive):
+      bodyweight / bw / peso: <number>
+      sleep / sueño: <number>h
+      food (quality): <number>/10
+      energy: <number>/10
+      hrv: <number>
+      steps: <number>
+    """
+    import re as _re
+
+    entry = {"date": entry_date, "notes": fact}
+
+    # Bodyweight
+    bw_match = _re.search(r"(?:bodyweight|bw|peso)[:\s]+(\d+(?:[.,]\d+)?)", fact, _re.I)
+    if bw_match:
+        entry["bodyweight"] = bw_match.group(1).replace(",", ".")
+
+    # Sleep
+    sleep_match = _re.search(r"(?:sleep|sueño|slept)[:\s]+(\d+(?:[.,]\d+)?)", fact, _re.I)
+    if sleep_match:
+        entry["sleep"] = sleep_match.group(1).replace(",", ".")
+
+    # Food quality (e.g. "food: 8/10" or "food quality: 7")
+    food_match = _re.search(r"(?:food(?:\s+quality)?)[:\s]+(\d+)", fact, _re.I)
+    if food_match:
+        entry["food_quality"] = food_match.group(1)
+
+    # Energy (stored in notes — no dedicated column, but useful for HealthAgent)
+    # Steps
+    steps_match = _re.search(r"steps[:\s]+(\d+)", fact, _re.I)
+    if steps_match:
+        entry["steps"] = steps_match.group(1)
+
+    return entry
 
 
 def _infer_preference_category(fact: str) -> str:

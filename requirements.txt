@@ -14,5 +14,8 @@ matplotlib>=3.8.0  # For weekly summary charts
 # Telegram bot
 python-telegram-bot>=20.0
 
+# PDF parsing (health data ingestion)
+pypdf>=4.0.0
+
 # Development (optional)
 pytest>=7.4.0

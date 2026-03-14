@@ -429,6 +429,152 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
+# Health data ingestion — document (PDF) and photo uploads
+# ---------------------------------------------------------------------------
+
+async def _extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract text from a PDF byte string using pypdf."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        text = "\n".join(pages).strip()
+        return text if text else "(PDF had no extractable text — may be scanned image)"
+    except ImportError:
+        return "(pypdf not installed — cannot extract PDF text)"
+    except Exception as e:
+        return f"(PDF extraction failed: {e})"
+
+
+async def _extract_photo_text(file_bytes: bytes) -> str:
+    """
+    Use Claude vision to extract health data from a photo (blood test screenshot,
+    watch summary, nutrition label, etc.). Returns extracted text/values.
+    """
+    import base64
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    image_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+
+    response = client.messages.create(
+        model=SONNET_MODEL,  # vision requires Sonnet
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "This is a health data image (blood test, watch summary, nutrition, etc.). "
+                        "Extract all numerical values, markers, and relevant health information as structured text. "
+                        "List every metric you can read: name, value, unit, reference range if shown. "
+                        "Be thorough — the coach will use this to give personalized advice."
+                    )
+                }
+            ]
+        }]
+    )
+    return response.content[0].text
+
+
+async def _handle_health_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               extracted_text: str, file_type: str,
+                               caption: str = "") -> None:
+    """
+    Common handler: given extracted text from a PDF/photo, call HealthAgent and reply.
+    """
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+
+    # Use caption as the user's question (if any), otherwise a generic prompt
+    user_question = caption.strip() if caption else f"Here's my {file_type} data."
+    _log_message("IN", f"[{file_type.upper()} upload] {caption or '(no caption)'}")
+
+    ctx = _build_bot_context()
+    try:
+        from health_agent import respond as health_respond
+        response = health_respond(
+            user_message=user_question,
+            base_context=ctx,
+            extra_data={file_type: extracted_text}
+        )
+    except Exception as e:
+        response = f"Got the {file_type} but hit an error analysing it: {e}"
+
+    await update.message.reply_text(response)
+    _log_message("OUT", response)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle PDF and document uploads — treat as health data."""
+    if not _is_authorized(update):
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    mime = doc.mime_type or ""
+    caption = update.message.caption or ""
+
+    # Only process PDFs for now — other file types get a polite redirect
+    if mime != "application/pdf" and not doc.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text(
+            "I can read PDFs (blood tests, lab results, etc.). "
+            "Send me a PDF and I'll analyse it. Other file types aren't supported yet."
+        )
+        return
+
+    await update.message.reply_text("Reading your PDF...")
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        file_bytes = await file.download_as_bytearray()
+        extracted = await _extract_pdf_text(bytes(file_bytes))
+        print(f"[Telegram] PDF received: {doc.file_name} ({len(extracted)} chars extracted)")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't download the PDF: {e}")
+        return
+
+    await _handle_health_file(update, context, extracted, "blood_data", caption)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo uploads — use Claude vision to extract health data."""
+    if not _is_authorized(update):
+        return
+
+    photos = update.message.photo
+    if not photos:
+        return
+
+    caption = update.message.caption or ""
+
+    await update.message.reply_text("Reading your photo...")
+    try:
+        # Use the largest available size
+        largest = max(photos, key=lambda p: p.file_size or 0)
+        file = await context.bot.get_file(largest.file_id)
+        file_bytes = await file.download_as_bytearray()
+        print(f"[Telegram] Photo received ({len(file_bytes)} bytes)")
+        extracted = await _extract_photo_text(bytes(file_bytes))
+        print(f"[Telegram] Vision extracted: {extracted[:100]}")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't read the photo: {e}")
+        return
+
+    await _handle_health_file(update, context, extracted, "blood_data", caption)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -444,6 +590,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("summary", handle_summary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     print("Bot running. Waiting for messages...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
