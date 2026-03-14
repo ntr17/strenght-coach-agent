@@ -173,11 +173,11 @@ def _build_bot_context() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Claude response generation
+# Claude response generation (context-injection path — used by /summary)
 # ---------------------------------------------------------------------------
 
 def _generate_response(user_message: str, context: str, model: str) -> str:
-    """Generate a coaching response via Claude."""
+    """Generate a coaching response via Claude (pre-loaded context path)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     bot_system = SYSTEM_PROMPT + (
@@ -188,7 +188,9 @@ def _generate_response(user_message: str, context: str, model: str) -> str:
         "If specific data is missing (exercise names, weights, dates, numbers), say so directly: "
         "'I don't have that detail in front of me right now.' "
         "Never invent training data, exercise names, weights, or results. "
-        "Never claim to have access to data that isn't shown in the context."
+        "Never claim to have access to data that isn't shown in the context.\n\n"
+        "NOTE: Estimated 1RM values are computed from prescribed weights unless the athlete "
+        "explicitly logged actual weights in session notes."
     )
 
     full_message = f"{context}\n\n---\n\nATHLETE MESSAGE (via Telegram): {user_message}\n\nReply as the coach."
@@ -200,6 +202,574 @@ def _generate_response(user_message: str, context: str, model: str) -> str:
         messages=[{"role": "user", "content": full_message}]
     )
     return message.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Tool use — Claude fetches exactly the data it needs
+# ---------------------------------------------------------------------------
+
+_TOOL_DEFINITIONS = [
+    {
+        "name": "get_coach_brain",
+        "description": (
+            "Fetch the coach's current knowledge: Coach State (per-domain summaries), "
+            "Coach Focus (open watch items), Athlete Preferences, Profile, Long-Term Goals, "
+            "and any pending proposals awaiting athlete confirmation. "
+            "Call this first for most questions."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_lift_history",
+        "description": (
+            "Fetch recent lift history for a specific exercise. Returns dates, weights, "
+            "sets/reps, and estimated 1RM values. "
+            "Note: Est 1RM is computed from prescribed weights unless athlete logged actual weights."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "exercise": {
+                    "type": "string",
+                    "description": "Exercise name (e.g. 'Squat', 'Bench Press'). Matched at start of name.",
+                },
+                "weeks": {
+                    "type": "integer",
+                    "description": "How many weeks back to look (default 8, max 24).",
+                },
+            },
+            "required": ["exercise"],
+        },
+    },
+    {
+        "name": "get_program_week",
+        "description": (
+            "Fetch prescribed workout data for a specific week — exercises, weights, sets/reps, done status. "
+            "Omit week_num to get the current week. Pass week_num to fetch any historical week (1-30). "
+            "Optionally pass sheet_id to read from a specific program sheet (use list_programs to find IDs)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "week_num": {
+                    "type": "integer",
+                    "description": "Week number to fetch (1-based). Omit for current week.",
+                },
+                "sheet_id": {
+                    "type": "string",
+                    "description": "Google Sheet ID of a specific program (from list_programs). Omit for active program.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_programs",
+        "description": (
+            "List all training programs — active and completed — with their Sheet IDs, "
+            "date ranges, and total weeks. Use this to discover what program history is available, "
+            "then fetch specific weeks using get_program_week with the sheet_id."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_projections",
+        "description": (
+            "Fetch computed 1RM projections, bodyweight trend, and program completion status. "
+            "These are Python math results — not LLM guesses. "
+            "Use for progress and goal-tracking questions."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_data_summary",
+        "description": (
+            "Get a quick overview of what training data is available — session counts per lift, "
+            "date ranges, and how much Est 1RM data exists. "
+            "Call this when you suspect data might be sparse or want to know what history is available "
+            "before deciding what to fetch in detail."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "log_lift",
+        "description": (
+            "Record a completed lift to the training archive (Lift History). "
+            "Use immediately when the athlete reports what they just lifted or mentions past performance. "
+            "Est 1RM is auto-computed from weight and reps using the Epley formula."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "exercise": {"type": "string", "description": "Exercise name (e.g. 'Squat', 'Bench Press')."},
+                "weight": {"type": "string", "description": "Weight lifted, e.g. '100kg' or '100'."},
+                "sets_reps": {"type": "string", "description": "Sets x reps, e.g. '3x5' or '4x4'."},
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD. Omit for today."},
+                "notes": {"type": "string", "description": "Optional notes about the set/session."},
+                "completed": {"type": "boolean", "description": "Whether completed successfully (default true)."},
+            },
+            "required": ["exercise", "weight", "sets_reps"],
+        },
+    },
+    {
+        "name": "log_bodyweight",
+        "description": (
+            "Record the athlete's bodyweight to the Health Log. "
+            "Use when the athlete mentions their weight, even in passing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "weight_kg": {"type": "number", "description": "Bodyweight in kg."},
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD. Omit for today."},
+                "notes": {"type": "string", "description": "Optional notes (sleep quality, energy, etc.)."},
+            },
+            "required": ["weight_kg"],
+        },
+    },
+    {
+        "name": "send_chart",
+        "description": (
+            "Generate and send a progress chart to the athlete via Telegram. "
+            "Use when the athlete asks for a visual chart, graph, or progress picture."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart_type": {
+                    "type": "string",
+                    "enum": ["1rm", "bodyweight", "volume"],
+                    "description": (
+                        "'1rm' = estimated 1RM over time for key lifts, "
+                        "'bodyweight' = bodyweight trend, "
+                        "'volume' = weekly training volume"
+                    ),
+                }
+            },
+            "required": ["chart_type"],
+        },
+    },
+]
+
+
+def _tool_get_coach_brain() -> str:
+    """Return the full Tier-1 context (reuses _build_bot_context)."""
+    return _build_bot_context()
+
+
+def _tool_get_lift_history(exercise: str, weeks: int = 8) -> str:
+    """Return recent lift history rows for a given exercise."""
+    import re as _re
+    from datetime import date as _date, timedelta
+    try:
+        from memory import read_lift_history
+        cutoff = str(_date.today() - timedelta(weeks=min(weeks, 24)))
+        all_rows = read_lift_history(limit=300)
+        pattern = _re.compile(r"(?i)^" + _re.escape(exercise) + r"(\s|$|\()")
+        rows = [
+            r for r in all_rows
+            if pattern.match(r.get("Exercise", "").strip())
+            and r.get("Date", "") >= cutoff
+        ]
+        if not rows:
+            return f"No lift history for '{exercise}' in the last {weeks} weeks."
+        lines = []
+        for r in rows[-25:]:  # cap at 25 rows to keep context tight
+            lines.append(
+                f"  {r.get('Date','')} | {r.get('Exercise','')} | "
+                f"{r.get('Weight','')} | {r.get('Sets x Reps','')} | "
+                f"Est 1RM: {r.get('Est 1RM','?')}kg"
+                + (f" | actual: {r.get('Actual','')}" if r.get("Actual") else "")
+            )
+        return f"Lift history for '{exercise}' (last {weeks} weeks, {len(rows)} sessions):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Could not load lift history: {e}"
+
+
+def _tool_get_program_week(week_num: int = None, sheet_id: str = None) -> str:
+    """Return workout data for a specific week from any program sheet."""
+    try:
+        from sheets import read_program_data
+        from config import compute_current_week, resolve_program_start_date
+        from workout_agent import _format_program_for_context
+
+        if week_num is None:
+            week_num = compute_current_week(resolve_program_start_date())
+
+        program_data = read_program_data(week_num=week_num, sheet_id=sheet_id or None)
+        result = _format_program_for_context(program_data)
+        label = f"Week {week_num}" + (f" (sheet: {sheet_id[:12]}...)" if sheet_id else " (active program)")
+        return f"{label}\n{result}" if result else f"{label}: no data found"
+    except Exception as e:
+        return f"Could not load program week {week_num}: {e}"
+
+
+def _tool_list_programs() -> str:
+    """Return all programs from the Active Sheets registry and Program History."""
+    try:
+        from memory import read_sheet_registry, read_program_history
+
+        lines = []
+
+        # Active Sheets registry (current + recently created programs)
+        registry = read_sheet_registry()
+        if registry:
+            lines.append("PROGRAM REGISTRY (Active Sheets tab):")
+            for entry in registry:
+                name = entry.get("Name", "?")
+                status = entry.get("Status", "?")
+                sheet_id = entry.get("Sheet ID", "")
+                start = entry.get("Start Date", "")
+                weeks = entry.get("Total Weeks", "")
+                notes = entry.get("Notes", "")
+                line = f"  [{status}] {name} | start: {start} | {weeks}wk"
+                if sheet_id:
+                    line += f" | sheet_id: {sheet_id}"
+                if notes:
+                    line += f" | {notes}"
+                lines.append(line)
+
+        # Program History tab (older programs)
+        history = read_program_history()
+        if history:
+            lines.append("\nPROGRAM HISTORY tab:")
+            for entry in history:
+                lines.append(
+                    f"  {entry.get('Program', entry.get('Name', '?'))} | "
+                    f"{entry.get('Start', entry.get('Start Date', '?'))} → "
+                    f"{entry.get('End', entry.get('End Date', '?'))} | "
+                    f"{entry.get('Notes', entry.get('Outcome', ''))}"
+                )
+
+        if not lines:
+            return "No program records found."
+
+        lines.append(
+            "\nTo fetch a specific week from a program, use get_program_week(week_num=N, sheet_id='...')."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Could not load program list: {e}"
+
+
+def _tool_get_projections() -> str:
+    """Return computed projections from the projection engine."""
+    try:
+        from memory import read_all
+        from projections import run_all_projections
+        memory_data = read_all()
+        result = run_all_projections(memory_data)
+        return result.get("formatted") or "Insufficient data for projections."
+    except Exception as e:
+        return f"Could not compute projections: {e}"
+
+
+def _tool_get_data_summary() -> str:
+    """Return a bird's-eye view of data availability per tracked lift."""
+    import re as _re
+    try:
+        from memory import read_lift_history, read_tracked_lifts
+        all_rows = read_lift_history(limit=500)
+        tracked = read_tracked_lifts()
+
+        if not all_rows:
+            return "No lift history data found in memory."
+
+        all_dates = sorted(r.get("Date", "") for r in all_rows if r.get("Date"))
+        total = len(all_rows)
+        span = f"{all_dates[0]} to {all_dates[-1]}" if all_dates else "no dates"
+
+        lines = [f"Lift History: {total} total sessions | {span}", ""]
+        for tl in tracked:
+            lift = tl["match_pattern"]
+            pattern = _re.compile(r"(?i)^" + _re.escape(lift) + r"(\s|$|\()")
+            rows = [r for r in all_rows if pattern.match(r.get("Exercise", "").strip())]
+            if rows:
+                dates = sorted(r.get("Date", "") for r in rows if r.get("Date"))
+                has_1rm = sum(1 for r in rows if r.get("Est 1RM"))
+                lines.append(
+                    f"  {lift}: {len(rows)} sessions | {dates[0]} to {dates[-1]} "
+                    f"| {has_1rm} with Est 1RM"
+                )
+            else:
+                lines.append(f"  {lift}: no sessions found")
+
+        lines.append(
+            "\nTo fetch detailed history for a lift, use get_lift_history(exercise, weeks=N). "
+            "For full history set weeks=24."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Could not load data summary: {e}"
+
+
+def _tool_log_lift(exercise: str, weight: str, sets_reps: str,
+                   date_str: str = None, notes: str = "", completed: bool = True) -> str:
+    """Append a lift session to Lift History with auto-computed Est 1RM."""
+    from datetime import date as _date
+    try:
+        from memory import append_lift_history, compute_epley
+        from config import compute_current_week, resolve_program_start_date
+
+        log_date = date_str or str(_date.today())
+        week_num = compute_current_week(resolve_program_start_date())
+        est_1rm = compute_epley(weight, sets_reps)
+
+        session = {
+            "date": log_date,
+            "week": str(week_num),
+            "day_label": f"Telegram_{log_date}",
+            "exercise_name": exercise,
+            "prescribed_weight": weight,
+            "actual": f"{weight} {sets_reps}".strip(),
+            "completed": completed,
+            "notes": notes or "[logged via Telegram]",
+            "sets_reps": sets_reps,
+        }
+        if est_1rm is not None:
+            session["est_1rm"] = est_1rm
+
+        append_lift_history([session])
+        est_str = f" | Est 1RM: {est_1rm}kg" if est_1rm else ""
+        return f"Logged: {exercise} {weight} {sets_reps} on {log_date}{est_str}."
+    except Exception as e:
+        return f"Could not log lift: {e}"
+
+
+def _tool_log_bodyweight(weight_kg: float, date_str: str = None, notes: str = "") -> str:
+    """Append a bodyweight entry to the Health Log."""
+    from datetime import date as _date
+    try:
+        from memory import append_health_log
+
+        log_date = date_str or str(_date.today())
+        append_health_log([{
+            "date": log_date,
+            "bodyweight": str(weight_kg),
+            "notes": notes or "[logged via Telegram]",
+        }])
+        return f"Logged bodyweight: {weight_kg}kg on {log_date}."
+    except Exception as e:
+        return f"Could not log bodyweight: {e}"
+
+
+def _execute_data_tool(name: str, inp: dict) -> str:
+    """Dispatch a data-fetching tool call synchronously."""
+    try:
+        if name == "get_coach_brain":
+            return _tool_get_coach_brain()
+        elif name == "get_lift_history":
+            return _tool_get_lift_history(inp.get("exercise", ""), inp.get("weeks", 8))
+        elif name == "get_program_week":
+            return _tool_get_program_week(inp.get("week_num"), inp.get("sheet_id"))
+        elif name == "list_programs":
+            return _tool_list_programs()
+        elif name == "get_projections":
+            return _tool_get_projections()
+        elif name == "get_data_summary":
+            return _tool_get_data_summary()
+        elif name == "log_lift":
+            return _tool_log_lift(
+                inp.get("exercise", ""), inp.get("weight", ""), inp.get("sets_reps", ""),
+                inp.get("date"), inp.get("notes", ""), inp.get("completed", True)
+            )
+        elif name == "log_bodyweight":
+            return _tool_log_bodyweight(inp.get("weight_kg", 0), inp.get("date"), inp.get("notes", ""))
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Tool error ({name}): {e}"
+
+
+async def _send_chart_tool(chart_type: str, chat_id: int, bot) -> str:
+    """Generate a chart and send it to Telegram. Returns status string."""
+    try:
+        from memory import read_lift_history, read_tracked_lifts, read_health_log
+        from charts import generate_1rm_chart, generate_bodyweight_chart, generate_volume_chart
+
+        if chart_type == "1rm":
+            history = read_lift_history(limit=200)
+            tracked = read_tracked_lifts()
+            buf = generate_1rm_chart(history, tracked)
+        elif chart_type == "bodyweight":
+            health = read_health_log(limit=180)
+            buf = generate_bodyweight_chart(health)
+        elif chart_type == "volume":
+            # volume chart requires weekly data — skip for now
+            return "Volume chart requires parsed weekly data and isn't wired via tool yet. Try /chart 1rm or /chart bodyweight."
+        else:
+            return f"Unknown chart type: {chart_type}"
+
+        if buf:
+            await bot.send_photo(chat_id=chat_id, photo=buf)
+            return f"{chart_type.upper()} chart sent."
+        else:
+            return "Not enough data to generate a chart yet (need at least a few sessions)."
+    except Exception as e:
+        return f"Chart generation failed: {e}"
+
+
+def _get_recent_conversation_turns(limit_pairs: int = 3) -> list[dict]:
+    """
+    Return the last N complete conversation pairs from Telegram Log as Claude message turns.
+    Always returns a valid alternating sequence ending with an assistant turn,
+    so the current user message can be appended without format errors.
+    """
+    try:
+        from memory import read_telegram_log
+        log = read_telegram_log(limit=limit_pairs * 2 + 4)
+
+        turns = []
+        for entry in log:
+            direction = entry.get("Direction", "")
+            msg = entry.get("Message", "").strip()
+            if not msg:
+                continue
+            role = "user" if direction == "IN" else "assistant"
+            # Skip system/command-only entries like "[chart: 1rm]"
+            if msg.startswith("[") and msg.endswith("]"):
+                continue
+            turns.append({"role": role, "content": msg})
+
+        # Merge consecutive same-role turns
+        merged: list[dict] = []
+        for turn in turns:
+            if merged and merged[-1]["role"] == turn["role"]:
+                merged[-1]["content"] += "\n" + turn["content"]
+            else:
+                merged.append({"role": turn["role"], "content": turn["content"]})
+
+        # Must start with user
+        while merged and merged[0]["role"] == "assistant":
+            merged.pop(0)
+
+        # Must end with assistant so we can add the current user turn cleanly
+        while merged and merged[-1]["role"] == "user":
+            merged.pop()
+
+        # Cap at limit_pairs exchanges
+        if len(merged) > limit_pairs * 2:
+            merged = merged[-(limit_pairs * 2):]
+
+        return merged
+    except Exception:
+        return []
+
+
+async def _generate_response_with_tools(user_message: str, chat_id: int, bot,
+                                         intent: str = "GENERAL") -> str:
+    """
+    Generate a coaching response using Claude tool use.
+
+    Claude decides which data to fetch rather than receiving everything pre-loaded.
+    Pre-seeds recent conversation turns for continuity.
+    Loops until Claude produces a final text response or tool limit is reached.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    if intent == "WORKOUT":
+        focus_note = (
+            "The athlete is asking about today's session or workout adaptation. "
+            "Call get_program_week first to see what's prescribed, then get_lift_history if needed. "
+            "Give specific advice: exact weights, sets/reps, substitutions if needed. "
+            "Log what they actually did using log_lift if they report performance.\n\n"
+        )
+    else:
+        focus_note = ""
+
+    system = (
+        f"You are {ATHLETE_NAME}'s strength coach, responding via Telegram. "
+        "You have tools to fetch real training data and to record new data — use them.\n\n"
+        + focus_note +
+        "Read tools: get_coach_brain, get_lift_history, get_program_week, list_programs, "
+        "get_projections, get_data_summary\n"
+        "Write tools: log_lift (record a session), log_bodyweight (record weight)\n"
+        "Visual: send_chart\n\n"
+        "Rules:\n"
+        "- Never invent numbers. Fetch or admit you don't have it.\n"
+        "- If athlete mentions a lift or bodyweight, log it immediately with the write tools.\n"
+        "- If data looks sparse, call get_data_summary, then fetch more with weeks=24.\n"
+        "- For past programs, use list_programs → get_program_week with sheet_id.\n"
+        "- Be concise: 1-4 sentences. No headers. Natural coach voice.\n"
+        "- Est 1RM is from prescribed weights unless athlete logged actuals."
+    )
+
+    # Pre-seed with recent conversation for continuity
+    history = _get_recent_conversation_turns(limit_pairs=3)
+    messages = history + [{"role": "user", "content": f"Athlete message: {user_message}"}]
+
+    max_rounds = 8
+    total_in, total_out = 0, 0
+
+    for _ in range(max_rounds):
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=600,
+            system=system,
+            tools=_TOOL_DEFINITIONS,
+            messages=messages,
+        )
+
+        total_in += response.usage.input_tokens
+        total_out += response.usage.output_tokens
+
+        # Collect any text from this turn
+        text_parts = [b.text for b in response.content if hasattr(b, "text") and b.text]
+
+        if response.stop_reason == "end_turn":
+            _log_token_cost(total_in, total_out, intent)
+            return " ".join(text_parts).strip() or "(No response)"
+
+        if response.stop_reason != "tool_use":
+            _log_token_cost(total_in, total_out, intent)
+            return " ".join(text_parts).strip() or f"(Unexpected stop: {response.stop_reason})"
+
+        # Execute tool calls
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            name = block.name
+            inp = block.input or {}
+            print(f"[ToolUse] {name}({inp})")
+
+            if name == "send_chart":
+                result = await _send_chart_tool(inp.get("chart_type", "1rm"), chat_id, bot)
+            else:
+                result = _execute_data_tool(name, inp)
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    _log_token_cost(total_in, total_out, intent)
+    return "(Response generation exceeded tool round limit — please try again.)"
+
+
+def _log_token_cost(input_tokens: int, output_tokens: int, label: str = "") -> None:
+    """Print token usage. Sonnet pricing: $3/M input, $15/M output."""
+    cost = (input_tokens / 1_000_000 * 3.0) + (output_tokens / 1_000_000 * 15.0)
+    print(f"[Cost] {label} | in={input_tokens} out={output_tokens} | ~${cost:.4f}")
+
+
+async def _process_incoming_message_background() -> None:
+    """
+    Run the Telegram processor in a thread-pool so it doesn't block the bot response.
+    Picks up the just-logged message and extracts structured facts into memory immediately.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        from processor import process_telegram_messages
+        processed = await loop.run_in_executor(None, process_telegram_messages)
+        if processed:
+            print(f"[Processor] Background run: {processed} message(s) processed")
+    except Exception as e:
+        print(f"[Processor] Background run failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +963,47 @@ async def handle_summary(update: Update, _context: ContextTypes.DEFAULT_TYPE) ->
     _log_message("OUT", response)
 
 
+async def handle_data(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a quick summary of what training data is available (/data)."""
+    if not _is_authorized(update):
+        return
+    await update.message.reply_text("Checking available data...")
+    result = _tool_get_data_summary()
+    await update.message.reply_text(result)
+    _log_message("IN", "/data")
+    _log_message("OUT", "[data summary]")
+
+
+async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a progress chart. Usage: /chart [1rm|bodyweight|volume]"""
+    if not _is_authorized(update):
+        return
+
+    args = context.args
+    chart_type = args[0].lower() if args else "1rm"
+
+    # Aliases
+    if chart_type in ("bw", "weight"):
+        chart_type = "bodyweight"
+
+    if chart_type not in ("1rm", "bodyweight", "volume"):
+        await update.message.reply_text(
+            "Available charts:\n/chart 1rm — estimated 1RM over time\n"
+            "/chart bodyweight — bodyweight trend\n/chart volume — weekly training volume"
+        )
+        return
+
+    await update.message.reply_text(f"Generating {chart_type} chart...")
+    result = await _send_chart_tool(chart_type, update.effective_chat.id, context.bot)
+
+    # _send_chart_tool sends the photo itself; only reply if there was an error
+    if "sent" not in result.lower():
+        await update.message.reply_text(result)
+
+    _log_message("IN", f"/chart {chart_type}")
+    _log_message("OUT", f"[chart: {chart_type}] {result}")
+
+
 def _classify_intent(message: str) -> str:
     """
     Use Haiku to classify the athlete's message into one of four routing categories:
@@ -442,6 +1053,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     _log_message("IN", user_text)
 
+    # Run processor in background immediately — extracts structured facts into memory
+    # without blocking the bot response
+    import asyncio as _asyncio
+    _asyncio.create_task(_process_incoming_message_background())
+
     # Check for SKIP_UNTIL control phrases
     lower = user_text.lower()
     if any(phrase in lower for phrase in _RESUME_PHRASES):
@@ -464,13 +1080,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         action="typing",
     )
 
-    ctx = _build_bot_context()
-
     # Classify intent with Haiku — single fast call instead of cascading keyword checks
     intent = _classify_intent(user_text)
     print(f"[Router] Intent: {intent} | Message: {user_text[:60]}")
 
     if intent == "PROGRAM":
+        ctx = _build_bot_context()
         try:
             from program_agent import respond as program_respond
             await update.message.reply_text("Thinking about your program... give me 30 seconds.")
@@ -487,6 +1102,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             print(f"[ProgramDesigner] Failed (falling back): {e}")
 
     elif intent == "HEALTH":
+        ctx = _build_bot_context()
         try:
             from health_agent import respond as health_respond
             response = health_respond(user_text, ctx)
@@ -498,17 +1114,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif intent == "WORKOUT":
         try:
-            from workout_agent import respond as workout_respond
-            response = workout_respond(user_text, ctx)
+            response = await _generate_response_with_tools(
+                user_text, update.effective_chat.id, context.bot, intent="WORKOUT"
+            )
             await update.message.reply_text(response)
             _log_message("OUT", response)
             return
         except Exception as e:
-            print(f"[WorkoutAgent] Failed (falling back): {e}")
+            print(f"[WorkoutToolUse] Failed (falling back): {e}")
 
-    # GENERAL intent or fallback from failed specialized agent
-    model = _choose_model(user_text)
-    response = _generate_response(user_text, ctx, model)
+    # GENERAL intent (or fallback from failed specialized agent/workout) — tool use
+    try:
+        response = await _generate_response_with_tools(
+            user_text, update.effective_chat.id, context.bot, intent="GENERAL"
+        )
+    except Exception as e:
+        print(f"[ToolUse] Failed, falling back to context injection: {e}")
+        ctx = _build_bot_context()
+        response = _generate_response(user_text, ctx, _choose_model(user_text))
 
     await update.message.reply_text(response)
     _log_message("OUT", response)
@@ -719,6 +1342,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("summary", handle_summary))
+    app.add_handler(CommandHandler("chart", handle_chart))
+    app.add_handler(CommandHandler("data", handle_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

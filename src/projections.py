@@ -76,6 +76,33 @@ def _exercise_matches(exercise_name: str, row_exercise: str) -> bool:
     return bool(re.match(pattern, row_exercise.strip()))
 
 
+def _collect_1rm_readings(
+    exercise_name: str,
+    lift_history: list[dict],
+    cutoff: Optional[date] = None,
+) -> list[tuple[date, float]]:
+    """
+    Collect (date, est_1rm) pairs for an exercise from lift_history.
+    cutoff: if provided, only include readings on/after this date. None = all history.
+    """
+    raw = []
+    for row in lift_history:
+        if not _exercise_matches(exercise_name, row.get("Exercise", "")):
+            continue
+        est = row.get("Est 1RM", "")
+        date_str = row.get("Date", "")
+        if not est or not date_str:
+            continue
+        try:
+            val = float(str(est).replace(",", "."))
+            d = _parse_date(date_str)
+            if d and val > 0 and (cutoff is None or d >= cutoff):
+                raw.append((d, val))
+        except (ValueError, TypeError):
+            pass
+    return raw
+
+
 def project_1rm(
     exercise_name: str,
     lift_history: list[dict],
@@ -91,7 +118,8 @@ def project_1rm(
         lift_history: rows from Lift History tab (must have Est 1RM + Date fields)
         target_1rm: goal 1RM in kg (optional — for on-track assessment)
         weeks_remaining: weeks left in program (optional)
-        window_days: only include readings from the last N days (default 42 = 6 weeks)
+        window_days: initial window in days (default 42 = 6 weeks).
+                     Auto-expands to full history if < 4 unique-date readings found.
 
     Matching: word-boundary at start — "Squat" matches "Squat (Volume)" but NOT "Front Squat".
 
@@ -100,26 +128,19 @@ def project_1rm(
 
     Returns dict with:
         exercise, current_1rm, rate_per_week, projected_end_1rm,
-        on_track (bool|None), weeks_to_target (float|None), data_points
+        on_track (bool|None), weeks_to_target (float|None), data_points, window_expanded
     Returns None if insufficient data (<2 unique-date readings).
     """
     cutoff = date.today() - timedelta(days=window_days)
+    raw = _collect_1rm_readings(exercise_name, lift_history, cutoff)
 
-    raw = []
-    for row in lift_history:
-        if not _exercise_matches(exercise_name, row.get("Exercise", "")):
-            continue
-        est = row.get("Est 1RM", "")
-        date_str = row.get("Date", "")
-        if not est or not date_str:
-            continue
-        try:
-            val = float(str(est).replace(",", "."))
-            d = _parse_date(date_str)
-            if d and val > 0 and d >= cutoff:
-                raw.append((d, val))
-        except (ValueError, TypeError):
-            pass
+    # Auto-expand: if the recent window is sparse, use full history for a better picture
+    window_expanded = False
+    if len(raw) < 4:
+        full_raw = _collect_1rm_readings(exercise_name, lift_history, cutoff=None)
+        if len(full_raw) > len(raw):
+            raw = full_raw
+            window_expanded = True
 
     if not raw:
         return None
@@ -169,6 +190,7 @@ def project_1rm(
         "weeks_to_target": round(weeks_to_target, 1) if weeks_to_target is not None else None,
         "data_points": len(readings),
         "trend_weeks": len(recent),
+        "window_expanded": window_expanded,
     }
 
 
@@ -317,25 +339,33 @@ def format_projections_for_prompt(
         ex = proj["exercise"]
         curr = proj["current_1rm"]
         rate = proj["rate_per_week"]
-        rate_str = f"{rate:+.2f}kg/wk"
+        data_pts = proj.get("data_points", 0)
+        reliable = data_pts >= 4
 
-        line = f"{ex}: {curr}kg est. 1RM | trend {rate_str}"
+        expanded = proj.get("window_expanded", False)
+        scope = " (full history)" if expanded else ""
+        if reliable:
+            rate_str = f"{rate:+.2f}kg/wk"
+            line = f"{ex}: {curr}kg est. 1RM | trend {rate_str}{scope}"
+        else:
+            line = f"{ex}: {curr}kg est. 1RM | trend unreliable ({data_pts} sessions{scope}, need 4+)"
 
         if proj.get("target_1rm"):
             line += f" | target {proj['target_1rm']}kg"
 
-        if proj.get("projected_end_1rm") is not None:
+        if reliable and proj.get("projected_end_1rm") is not None:
             line += f" | projected at end: {proj['projected_end_1rm']}kg"
 
-        if proj.get("on_track") is True:
-            line += " | ON TRACK"
-        elif proj.get("on_track") is False:
-            wtt = proj.get("weeks_to_target")
-            wr = program_projection["weeks_remaining"] if program_projection else None
-            if wtt and wr:
-                line += f" | BEHIND ({wtt:.0f}wk needed, {wr}wk left)"
-            else:
-                line += " | BEHIND TARGET"
+        if reliable:
+            if proj.get("on_track") is True:
+                line += " | ON TRACK"
+            elif proj.get("on_track") is False:
+                wtt = proj.get("weeks_to_target")
+                wr = program_projection["weeks_remaining"] if program_projection else None
+                if wtt and wr:
+                    line += f" | BEHIND ({wtt:.0f}wk needed, {wr}wk left)"
+                else:
+                    line += " | BEHIND TARGET"
 
         lines.append(line)
 
