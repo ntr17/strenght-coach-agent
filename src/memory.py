@@ -960,37 +960,121 @@ def compute_epley(weight_str: str, sets_reps_str: str) -> Optional[float]:
         return None
 
 
+def _lift_history_key(row_values: list) -> tuple:
+    """
+    Canonical dedup key for a Lift History row.
+    Uses (week, day_label, exercise) — stable even when date column is empty.
+    Normalised to lowercase + stripped to handle minor formatting differences.
+    """
+    week = str(row_values[1] if len(row_values) > 1 else "").strip().lower()
+    day  = str(row_values[2] if len(row_values) > 2 else "").strip().lower()
+    exer = str(row_values[3] if len(row_values) > 3 else "").strip().lower()
+    return (week, day, exer)
+
+
+def _session_to_row(s: dict) -> list:
+    """Convert a session dict to a Lift History row (list of cell values)."""
+    weight_for_1rm = s.get("actual") or s.get("prescribed_weight", "")
+    est_1rm = s.get("est_1rm") or compute_epley(weight_for_1rm, s.get("sets_reps", ""))
+    est_1rm_str = str(est_1rm) if est_1rm is not None else ""
+    return [
+        str(s.get("date", date.today())),
+        str(s.get("week", "")),
+        str(s.get("day_label", "")),
+        str(s.get("exercise_name", "")),
+        str(s.get("prescribed_weight", "")),
+        str(s.get("actual", "")),
+        "Y" if s.get("completed") else ("N" if s.get("completed") is False else "?"),
+        str(s.get("notes", "")),
+        est_1rm_str,
+    ]
+
+
+def upsert_lift_history(sessions: list[dict]) -> tuple[int, int]:
+    """
+    Upsert sessions into Lift History.
+
+    Match key: (week, day_label, exercise_name) — robust even when date is missing.
+    - If a matching row exists and actual/notes/est_1rm have changed → update it.
+    - If no match → append as new row.
+
+    Returns (inserted, updated) counts.
+    """
+    if not sessions:
+        return 0, 0
+
+    sheet = _get_memory_sheet()
+    ws = _get_tab(sheet, TAB_LIFT_HISTORY)
+    all_rows = ws.get_all_values()
+
+    # Build key → (row_index_1based, current_actual, current_notes, current_1rm) map
+    # Skip header row (index 0)
+    existing: dict[tuple, tuple] = {}
+    for i, row in enumerate(all_rows[1:], start=2):  # gspread row 2 = first data row
+        key = _lift_history_key(row)
+        if key[2]:  # only index if exercise is non-empty
+            existing[key] = (i, row)
+
+    inserted = 0
+    updated = 0
+    rows_to_append = []
+
+    for s in sessions:
+        new_row = _session_to_row(s)
+        key = (
+            str(s.get("week", "")).strip().lower(),
+            str(s.get("day_label", "")).strip().lower(),
+            str(s.get("exercise_name", "")).strip().lower(),
+        )
+
+        if key[2] and key in existing:
+            # Row exists — check if updatable fields changed
+            row_idx, old_row = existing[key]
+            old_actual  = str(old_row[5] if len(old_row) > 5 else "").strip()
+            old_notes   = str(old_row[7] if len(old_row) > 7 else "").strip()
+            old_1rm     = str(old_row[8] if len(old_row) > 8 else "").strip()
+            new_actual  = new_row[5].strip()
+            new_notes   = new_row[7].strip()
+            new_1rm     = new_row[8].strip()
+
+            changed = (
+                (new_actual  and new_actual  != old_actual)  or
+                (new_notes   and new_notes   != old_notes)   or
+                (new_1rm     and new_1rm     != old_1rm)
+            )
+            if changed:
+                # Update only the mutable columns: Actual(6), Notes(8), Est1RM(9) — 1-indexed
+                if new_actual and new_actual != old_actual:
+                    ws.update_cell(row_idx, 6, new_actual)
+                if new_notes and new_notes != old_notes:
+                    ws.update_cell(row_idx, 8, new_notes)
+                if new_1rm and new_1rm != old_1rm:
+                    ws.update_cell(row_idx, 9, new_1rm)
+                updated += 1
+        else:
+            rows_to_append.append(new_row)
+
+    if rows_to_append:
+        ws.append_rows(rows_to_append)
+        inserted += len(rows_to_append)
+
+    return inserted, updated
+
+
 def append_lift_history(sessions: list[dict]) -> None:
     """
     Append new session data to Lift History.
     Each session dict: {week, day_label, exercise_name, prescribed_weight,
                         actual, completed, notes, date, est_1rm (optional)}
     Est 1RM is computed automatically if not provided.
+    NOTE: prefer upsert_lift_history() for new code — this is kept for compatibility.
     """
     if not sessions:
         return
     sheet = _get_memory_sheet()
     ws = _get_tab(sheet, TAB_LIFT_HISTORY)
 
-    rows = []
-    for s in sessions:
-        # Use actual weight for 1RM if available, else prescribed
-        weight_for_1rm = s.get("actual") or s.get("prescribed_weight", "")
-        est_1rm = s.get("est_1rm") or compute_epley(weight_for_1rm, s.get("sets_reps", ""))
-        est_1rm_str = str(est_1rm) if est_1rm is not None else ""
-
-        rows.append([
-            str(s.get("date", date.today())),
-            str(s.get("week", "")),
-            str(s.get("day_label", "")),
-            str(s.get("exercise_name", "")),
-            str(s.get("prescribed_weight", "")),
-            str(s.get("actual", "")),
-            "Y" if s.get("completed") else ("N" if s.get("completed") is False else "?"),
-            str(s.get("notes", "")),
-            est_1rm_str,
-        ])
-
+    rows = [_session_to_row(s) for s in sessions]
     ws.append_rows(rows)
 
 
@@ -1095,24 +1179,18 @@ def update_program_history(program_name: str, start_date: str,
 
 def sync_sessions_to_history(program_data: dict) -> list[dict]:
     """
-    Compare program data against existing Lift History to find new sessions.
-    Appends new sessions and returns the list of what was synced.
+    Upsert program sessions into Lift History.
 
-    A session is "new" if it's marked Done and isn't already in Lift History
-    for that date+exercise combination.
+    For each Done session: insert if new, update if actual/notes/est_1rm changed.
+    Match key is (week, day_label, exercise) — robust even when session dates are missing.
+    Returns list of sessions that were inserted or updated.
     """
-    existing = read_lift_history(limit=500)
-    existing_keys = set()
-    for row in existing:
-        key = (row.get("Date", ""), row.get("Exercise", ""))
-        existing_keys.add(key)
-
-    new_sessions = []
     current_week = program_data.get("current_week")
     if not current_week:
         return []
 
     week_num = current_week.get("week_num", "?")
+    sessions = []
 
     for day in current_week.get("days", []):
         day_label = day.get("label", "")
@@ -1121,12 +1199,7 @@ def sync_sessions_to_history(program_data: dict) -> list[dict]:
         for ex in day.get("exercises", []):
             if ex.get("done") is not True:
                 continue
-
-            key = (str(session_date or ""), ex["name"])
-            if key in existing_keys:
-                continue
-
-            new_sessions.append({
+            sessions.append({
                 "date": session_date or date.today(),
                 "week": week_num,
                 "day_label": day_label,
@@ -1138,10 +1211,12 @@ def sync_sessions_to_history(program_data: dict) -> list[dict]:
                 "notes": ex.get("session_note") or ex.get("notes", ""),
             })
 
-    if new_sessions:
-        append_lift_history(new_sessions)
+    if sessions:
+        inserted, updated = upsert_lift_history(sessions)
+        if inserted or updated:
+            print(f"    [LiftHistory] {inserted} inserted, {updated} updated")
 
-    return new_sessions
+    return sessions
 
 
 def sync_health_log(program_data: dict) -> list[dict]:

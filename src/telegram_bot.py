@@ -399,6 +399,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     ctx = _build_bot_context()
 
+    # Route program design requests to the ProgramDesignerAgent
+    try:
+        from program_agent import is_program_design_query, respond as program_respond
+        if is_program_design_query(user_text):
+            await update.message.reply_text("On it — designing your program now. This takes about 30 seconds...")
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action="typing"
+            )
+            response = program_respond(user_text, ctx)
+            # Telegram has a 4096 char limit — split if needed
+            if len(response) > 4000:
+                await update.message.reply_text(response[:4000])
+                await update.message.reply_text(response[4000:])
+            else:
+                await update.message.reply_text(response)
+            _log_message("OUT", response)
+            return
+    except Exception as e:
+        print(f"[ProgramDesigner] Failed (falling back to standard): {e}")
+
     # Route health/recovery/nutrition questions to the HealthAgent
     try:
         from health_agent import is_health_query, respond as health_respond
