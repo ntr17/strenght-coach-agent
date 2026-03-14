@@ -60,6 +60,27 @@ def _choose_model(message_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# In-memory tool cache (60s TTL — avoids redundant sheet reads within one session)
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+_TOOL_CACHE: dict = {}
+_TOOL_CACHE_TTL = 60  # seconds
+
+
+def _cache_get(key: str):
+    entry = _TOOL_CACHE.get(key)
+    if entry and (_time.time() - entry["ts"]) < _TOOL_CACHE_TTL:
+        return entry["value"]
+    return None
+
+
+def _cache_set(key: str, value: str) -> None:
+    _TOOL_CACHE[key] = {"value": value, "ts": _time.time()}
+
+
+# ---------------------------------------------------------------------------
 # Build context for the bot response
 # ---------------------------------------------------------------------------
 
@@ -366,6 +387,17 @@ _TOOL_DEFINITIONS = [
             "required": ["chart_type"],
         },
     },
+    {
+        "name": "get_program_comparison",
+        "description": (
+            "Compare 1RM gains across all historical training programs. "
+            "Shows start vs end 1RM and total gain per lift for each completed program, "
+            "plus the current program's progress so far. "
+            "Use for long-term progress review, motivation, or when athlete asks "
+            "'how do I compare to previous programs?' or 'what's my best ever?'"
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -595,33 +627,74 @@ def _tool_log_bodyweight(weight_kg: float, date_str: str = None, notes: str = ""
         return f"Could not log bodyweight: {e}"
 
 
+def _tool_get_program_comparison() -> str:
+    """Return cross-program 1RM comparison via the projections engine."""
+    try:
+        from memory import read_all, read_sheet_registry
+        from projections import compare_program_progress
+        memory_data = read_all()
+        lift_history = memory_data.get("lift_history", [])
+        program_registry = read_sheet_registry()
+        # Build minimal current_program_info from registry
+        active = next((p for p in program_registry if p.get("Status", "").upper() == "ACTIVE"), None)
+        current_program_info = {}
+        if active:
+            current_program_info = {
+                "name": active.get("Name", "Current Program"),
+                "start_date": active.get("Start Date", ""),
+                "total_weeks": active.get("Total Weeks", ""),
+            }
+        return compare_program_progress(lift_history, program_registry, current_program_info) or "No program comparison data available yet."
+    except Exception as e:
+        return f"Could not compare programs: {e}"
+
+
+_CACHEABLE_TOOLS = {"get_coach_brain", "get_lift_history", "get_projections",
+                    "get_data_summary", "get_program_comparison"}
+
+
 def _execute_data_tool(name: str, inp: dict) -> str:
     """Dispatch a data-fetching tool call synchronously."""
+    # Check cache for read tools
+    cache_key = f"{name}:{sorted(inp.items())}" if name in _CACHEABLE_TOOLS else None
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            print(f"[Cache] HIT {name}")
+            return cached
+
     try:
         if name == "get_coach_brain":
-            return _tool_get_coach_brain()
+            result = _tool_get_coach_brain()
         elif name == "get_lift_history":
-            return _tool_get_lift_history(inp.get("exercise", ""), inp.get("weeks", 8))
+            result = _tool_get_lift_history(inp.get("exercise", ""), inp.get("weeks", 8))
         elif name == "get_program_week":
-            return _tool_get_program_week(inp.get("week_num"), inp.get("sheet_id"))
+            result = _tool_get_program_week(inp.get("week_num"), inp.get("sheet_id"))
         elif name == "list_programs":
-            return _tool_list_programs()
+            result = _tool_list_programs()
         elif name == "get_projections":
-            return _tool_get_projections()
+            result = _tool_get_projections()
         elif name == "get_data_summary":
-            return _tool_get_data_summary()
+            result = _tool_get_data_summary()
+        elif name == "get_program_comparison":
+            result = _tool_get_program_comparison()
         elif name == "log_lift":
-            return _tool_log_lift(
+            result = _tool_log_lift(
                 inp.get("exercise", ""), inp.get("weight", ""), inp.get("sets_reps", ""),
                 inp.get("date"), inp.get("notes", ""), inp.get("completed", True)
             )
         elif name == "get_health_log":
-            return _tool_get_health_log(inp.get("days", 14))
+            result = _tool_get_health_log(inp.get("days", 14))
         elif name == "log_bodyweight":
-            return _tool_log_bodyweight(inp.get("weight_kg", 0), inp.get("date"), inp.get("notes", ""))
-        return f"Unknown tool: {name}"
+            result = _tool_log_bodyweight(inp.get("weight_kg", 0), inp.get("date"), inp.get("notes", ""))
+        else:
+            return f"Unknown tool: {name}"
     except Exception as e:
         return f"Tool error ({name}): {e}"
+
+    if cache_key:
+        _cache_set(cache_key, result)
+    return result
 
 
 async def _send_chart_tool(chart_type: str, chat_id: int, bot) -> str:
@@ -1436,6 +1509,111 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Voice message transcription (Whisper API)
+# ---------------------------------------------------------------------------
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Transcribe a voice message via OpenAI Whisper, then route as normal text.
+    Requires OPENAI_API_KEY env var. Gracefully degrades if not set.
+    """
+    if not _is_authorized(update):
+        return
+
+    voice = update.message.voice
+    if not voice:
+        return
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_key:
+        await update.message.reply_text(
+            "Voice messages require Whisper transcription — OPENAI_API_KEY not set. "
+            "Please send a text message instead."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        import io
+        import openai
+
+        # Download voice file (OGG/Opus from Telegram)
+        file = await context.bot.get_file(voice.file_id)
+        file_bytes = await file.download_as_bytearray()
+        print(f"[Voice] Received {len(file_bytes)} bytes (duration: {voice.duration}s)")
+
+        # Transcribe with Whisper
+        oai_client = openai.OpenAI(api_key=openai_key)
+        audio_buffer = io.BytesIO(bytes(file_bytes))
+        audio_buffer.name = "voice.ogg"  # Whisper needs a filename hint
+
+        transcript = oai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_buffer,
+            language="es",  # Nacho speaks Spanish; Whisper handles English too
+        )
+        transcribed_text = transcript.text.strip()
+        print(f"[Voice] Transcribed: {transcribed_text[:100]}")
+
+    except ImportError:
+        await update.message.reply_text(
+            "openai package not installed — can't transcribe voice. "
+            "Run: pip install openai"
+        )
+        return
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't transcribe your voice message: {e}")
+        return
+
+    if not transcribed_text:
+        await update.message.reply_text("Couldn't transcribe that — please try again or send text.")
+        return
+
+    # Echo the transcript so athlete can confirm what was heard
+    await update.message.reply_text(f'_(Heard: "{transcribed_text}")_', parse_mode="Markdown")
+
+    # Route through normal message handling (log, process, respond)
+    _log_message("IN", f"[Voice] {transcribed_text}")
+
+    import asyncio as _asyncio
+    _asyncio.create_task(_process_incoming_message_background())
+
+    # Reuse the same confirmation + intent routing as handle_message
+    lower = transcribed_text.lower()
+    if any(phrase in lower for phrase in _RESUME_PHRASES):
+        cleared = _end_skip_until()
+        reply = "Done — emails resume tonight." if cleared else "No active email pause found."
+        await update.message.reply_text(reply)
+        _log_message("OUT", reply)
+        return
+
+    # Build a synthetic Update-like check for proposals
+    class _FakeUpdate:
+        message = update.message
+        effective_chat = update.effective_chat
+
+    if await _handle_confirmation(_FakeUpdate(), transcribed_text):
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    intent = _classify_intent(transcribed_text)
+    print(f"[Router/Voice] Intent: {intent}")
+
+    try:
+        response = await _generate_response_with_tools(
+            transcribed_text, update.effective_chat.id, context.bot, intent=intent
+        )
+    except Exception as e:
+        print(f"[Voice] Tool-use failed, falling back: {e}")
+        ctx = _build_bot_context()
+        response = _generate_response(transcribed_text, ctx, SONNET_MODEL)
+
+    await update.message.reply_text(response)
+    _log_message("OUT", response)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1454,6 +1632,7 @@ def main() -> None:
     app.add_handler(CommandHandler("chart", handle_chart))
     app.add_handler(CommandHandler("data", handle_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 

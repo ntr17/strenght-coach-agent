@@ -763,9 +763,40 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
     print("  Computing projections...")
     try:
         from projections import run_all_projections
-        projections = run_all_projections(memory_data)
+        projections = run_all_projections(memory_data, program_data=program_data)
         if projections.get("formatted"):
             print(f"    → {projections['formatted'].count(chr(10)) + 1} projection line(s) computed")
+        # Volume spike alerting
+        spikes = projections.get("volume_spikes", [])
+        if spikes and not dry_run and not no_sync:
+            from memory import append_coach_focus
+            existing_focus = memory_data.get("coach_focus", [])
+            open_items_text = [f.get("Item", "").lower() for f in existing_focus
+                               if f.get("Status", "OPEN") == "OPEN"]
+            for spike in spikes:
+                note = (f"{spike['lift']}: volume spike {spike['pct_increase']}% "
+                        f"({spike['from_tonnage']}→{spike['to_tonnage']}kg tonnage "
+                        f"{spike['from_week']}→{spike['to_week']}) — injury risk window")
+                if "volume spike" not in " ".join(open_items_text):
+                    append_coach_focus("CONCERN", note, priority="HIGH", last_mentioned=str(today))
+                    print(f"    [Volume spike] {note[:80]}")
+        # Deload auto-detection
+        fatigue = projections.get("fatigue")
+        if fatigue and fatigue.get("deload_recommended") and not dry_run and not no_sync:
+            from memory import append_coach_focus
+            deload_note = (f"TSB={fatigue['TSB']:+.1f} — {fatigue['readiness']}. "
+                           "Consider a deload week this cycle.")
+            print(f"    [Deload signal] {deload_note}")
+            try:
+                from telegram_utils import send_telegram_message
+                send_telegram_message(f"Recovery check: {deload_note}")
+            except Exception:
+                pass
+            existing_focus = memory_data.get("coach_focus", [])
+            open_items_text = [f.get("Item", "").lower() for f in existing_focus
+                               if f.get("Status", "OPEN") == "OPEN"]
+            if "deload" not in " ".join(open_items_text):
+                append_coach_focus("CONCERN", deload_note, priority="HIGH", last_mentioned=str(today))
     except Exception as e:
         print(f"  Projections failed (non-fatal): {e}")
         projections = {}
@@ -809,14 +840,16 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
     # 8b. Build prompt (initial pass, without plateau dives)
     print("  Building prompt...")
-    system_prompt, user_message = build_prompt(
-        program_data, memory_data,
+    _prompt_kwargs = dict(
         last_run_date=last_run_date,
         replies=replies,
         is_weekly_summary=is_weekly_summary,
         projections_text=projections.get("formatted", ""),
         program_complete=program_complete,
+        tonnage_by_lift=projections.get("tonnage_by_lift"),
+        cross_program=projections.get("cross_program", ""),
     )
+    system_prompt, user_message = build_prompt(program_data, memory_data, **_prompt_kwargs)
 
     # 9. Plateau detection + per-lift deep dives
     print("  Checking for plateaus...")
@@ -827,12 +860,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         # Rebuild prompt with deep dive context included
         system_prompt, user_message = build_prompt(
             program_data, memory_data,
-            last_run_date=last_run_date,
-            replies=replies,
-            is_weekly_summary=is_weekly_summary,
-            plateau_deep_dives=plateau_dives,
-            projections_text=projections.get("formatted", ""),
-            program_complete=program_complete,
+            **{**_prompt_kwargs, "plateau_deep_dives": plateau_dives},
         )
 
     # 9b. Outcome learning loop: detect easy/hard difficulty patterns per lift

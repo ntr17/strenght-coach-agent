@@ -9,6 +9,7 @@ All functions return structured dicts. format_projections_for_prompt()
 converts them into a compact text block ready for prompt injection.
 """
 
+import math
 import re
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -175,8 +176,7 @@ def project_1rm(
     on_track = None
     weeks_to_target = None
     if target_1rm is not None and slope > 0:
-        current_x = _weeks_since(reference_date, latest_date)
-        weeks_to_target = (target_1rm - current_1rm) / slope if slope > 0 else None
+        weeks_to_target = (target_1rm - current_1rm) / slope
         if weeks_to_target is not None:
             on_track = (weeks_remaining is None) or (weeks_to_target <= weeks_remaining)
 
@@ -311,6 +311,316 @@ def project_program_completion(
 
 
 # ---------------------------------------------------------------------------
+# Tonnage tracking — weekly volume per lift
+# ---------------------------------------------------------------------------
+
+def _parse_weight_kg(text: str) -> Optional[float]:
+    """Extract numeric kg value from strings like '90kg', '90', '90.5 kg'."""
+    if not text:
+        return None
+    cleaned = re.sub(r'\s*kg\s*$', '', str(text).strip(), flags=re.I).strip()
+    try:
+        return float(cleaned.replace(',', '.'))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_sets_reps(text: str) -> Optional[tuple]:
+    """
+    Parse (sets, reps) from strings like '4x5', '4 x 5', '3x8-10', '5 sets of 3'.
+    For ranges like '8-10', returns the lower number.
+    Returns None if unparseable.
+    """
+    if not text:
+        return None
+    text = str(text).strip()
+    # "4x5" or "4 x 5" or "4X5" — optionally with range on reps side
+    m = re.match(r'(\d+)\s*[xX×]\s*(\d+)', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # "5 sets of 3"
+    m = re.search(r'(\d+)\s*sets?\s*(?:of\s*)?(\d+)', text, re.I)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def compute_weekly_tonnage(
+    program_data: dict,
+    tracked_lifts: list[dict] = None,
+) -> dict:
+    """
+    Compute total tonnage (kg lifted) per lift per week from recent program data.
+    Only counts completed exercises (done=True) with parseable weight and sets/reps.
+
+    Returns: {lift_name: {week_label: tonnage_kg, ...}, ...}
+    """
+    if tracked_lifts:
+        lift_patterns = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
+                         if tl.get("lift_type", "MAIN") in ("MAIN", "AUXILIARY")]
+    else:
+        lift_patterns = KEY_LIFTS
+
+    result: dict[str, dict[str, float]] = {}
+
+    all_weeks = []
+    recent_weeks = program_data.get("recent_weeks", [])
+    current_week = program_data.get("current_week")
+    if recent_weeks:
+        all_weeks.extend(recent_weeks)
+    if current_week:
+        all_weeks.append(current_week)
+
+    for week in all_weeks:
+        week_label = f"Wk{week.get('week_num', '?')}"
+        for day in week.get("days", []):
+            for ex in day.get("exercises", []):
+                if ex.get("done") is not True:
+                    continue
+                name = (ex.get("name") or "").strip()
+                weight_str = ex.get("weight") or ex.get("actual") or ""
+                sets_reps_str = ex.get("sets_reps") or ""
+
+                weight = _parse_weight_kg(weight_str)
+                sr = _parse_sets_reps(sets_reps_str)
+                if weight is None or sr is None or weight <= 0:
+                    continue
+                sets, reps = sr
+                tonnage = weight * sets * reps
+
+                # Match against tracked lifts
+                for _domain, pattern in lift_patterns:
+                    if re.search(r'(?i)\b' + re.escape(pattern) + r'\b', name):
+                        result.setdefault(pattern, {})
+                        result[pattern][week_label] = result[pattern].get(week_label, 0) + tonnage
+                        break
+
+    return result
+
+
+def detect_volume_spikes(
+    tonnage_by_lift: dict,
+    threshold: float = 0.15,
+) -> list[dict]:
+    """
+    Detect week-over-week tonnage spikes > threshold (default 15%).
+    Returns list of {lift, from_week, to_week, from_tonnage, to_tonnage, pct_increase}.
+    """
+    spikes = []
+    for lift, weekly in tonnage_by_lift.items():
+        weeks = sorted(weekly.keys())
+        if len(weeks) < 2:
+            continue
+        prev_label = weeks[-2]
+        curr_label = weeks[-1]
+        prev_t = weekly[prev_label]
+        curr_t = weekly[curr_label]
+        if prev_t > 0:
+            pct = (curr_t - prev_t) / prev_t
+            if pct > threshold:
+                spikes.append({
+                    "lift": lift,
+                    "from_week": prev_label,
+                    "to_week": curr_label,
+                    "from_tonnage": round(prev_t),
+                    "to_tonnage": round(curr_t),
+                    "pct_increase": round(pct * 100, 1),
+                })
+    return spikes
+
+
+def format_tonnage_for_prompt(tonnage_by_lift: dict) -> str:
+    """Format weekly tonnage as a compact table for prompt injection."""
+    if not tonnage_by_lift:
+        return ""
+    lines = []
+    for lift, weekly in sorted(tonnage_by_lift.items()):
+        weeks = sorted(weekly.keys())
+        pts = " | ".join(f"{w}: {weekly[w]:.0f}kg" for w in weeks[-4:])
+        lines.append(f"  {lift}: {pts}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Fatigue model — ATL / CTL / TSB (Banister impulse-response)
+# ---------------------------------------------------------------------------
+
+def compute_fatigue_model(lift_history: list[dict]) -> Optional[dict]:
+    """
+    Compute ATL/CTL/TSB from lift history using daily Est 1RM sum as training load proxy.
+
+    ATL (Acute Training Load)   — exponential moving avg, tau=7 days → fatigue
+    CTL (Chronic Training Load) — exponential moving avg, tau=42 days → fitness
+    TSB (Training Stress Balance) = CTL - ATL → readiness
+
+    TSB > 10:    Fresh (performance potential high)
+    TSB 0-10:    Optimal (balanced)
+    TSB -10 to 0: Fatigued (manageable)
+    TSB < -10:   Overtrained (deload recommended)
+
+    Returns None if insufficient data (< 14 days of history).
+    """
+    daily_load: dict[date, float] = {}
+    for row in lift_history:
+        d = _parse_date(row.get("Date", ""))
+        est = row.get("Est 1RM", "")
+        if not d or not est:
+            continue
+        try:
+            load = float(str(est).replace(",", "."))
+            if load > 0:
+                daily_load[d] = daily_load.get(d, 0.0) + load
+        except (ValueError, TypeError):
+            pass
+
+    if len(daily_load) < 7:
+        return None
+
+    # Normalize loads to 0-100 scale to make ATL/CTL/TSB interpretable
+    max_load = max(daily_load.values()) or 1.0
+    normalized = {d: v / max_load * 100 for d, v in daily_load.items()}
+
+    today = date.today()
+    start = min(normalized.keys())
+    alpha_atl = 1 - math.exp(-1 / 7)   # 7-day decay
+    alpha_ctl = 1 - math.exp(-1 / 42)  # 42-day decay
+
+    ATL = 0.0
+    CTL = 0.0
+    current = start
+    while current <= today:
+        load = normalized.get(current, 0.0)
+        ATL = ATL * (1 - alpha_atl) + load * alpha_atl
+        CTL = CTL * (1 - alpha_ctl) + load * alpha_ctl
+        current += timedelta(days=1)
+
+    TSB = CTL - ATL
+
+    if TSB > 10:
+        readiness = "Fresh — high performance potential"
+    elif TSB > 0:
+        readiness = "Optimal — balanced load"
+    elif TSB > -10:
+        readiness = "Fatigued — manageable, watch recovery"
+    else:
+        readiness = "Overtrained — deload recommended"
+
+    return {
+        "ATL": round(ATL, 1),
+        "CTL": round(CTL, 1),
+        "TSB": round(TSB, 1),
+        "readiness": readiness,
+        "deload_recommended": TSB < -10,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-program analytics
+# ---------------------------------------------------------------------------
+
+def compare_program_progress(
+    lift_history: list[dict],
+    program_registry: list[dict],
+    current_program_info: dict = None,
+) -> str:
+    """
+    Compare 1RM gains across historical programs vs current program.
+    For each completed program: find peak 1RM in first 4 weeks vs last 4 weeks → gain.
+    For current program: compare same way vs historical average at same position.
+
+    Returns formatted text, or "" if insufficient data.
+    """
+    if not lift_history or not program_registry:
+        return ""
+
+    # Parse lift_history once → {date: {exercise: max_1rm}}
+    by_date: dict[date, dict[str, float]] = {}
+    for row in lift_history:
+        d = _parse_date(row.get("Date", ""))
+        ex = row.get("Exercise", "").strip()
+        est = row.get("Est 1RM", "")
+        if not d or not ex or not est:
+            continue
+        try:
+            val = float(str(est).replace(",", "."))
+            by_date.setdefault(d, {})
+            by_date[d][ex] = max(by_date[d].get(ex, 0.0), val)
+        except (ValueError, TypeError):
+            pass
+
+    if not by_date:
+        return ""
+
+    def _get_peak_1rm_in_range(start: date, end: date, lift_pattern: str) -> Optional[float]:
+        vals = []
+        for d, exercises in by_date.items():
+            if start <= d <= end:
+                for ex, val in exercises.items():
+                    if re.search(r'(?i)\b' + re.escape(lift_pattern) + r'\b', ex):
+                        vals.append(val)
+        return max(vals) if vals else None
+
+    key_patterns = [("Squat", "SQUAT"), ("Bench Press", "BENCH"), ("Deadlift", "DEADLIFT")]
+
+    # Build historical program summaries
+    completed = [p for p in program_registry if p.get("Status", "").lower() in ("completed", "done")]
+    history_lines = []
+
+    for prog in completed:
+        start_str = prog.get("Start Date") or prog.get("start_date") or ""
+        total_w = prog.get("Total Weeks") or prog.get("total_weeks") or ""
+        name = prog.get("Name") or prog.get("name") or "Unknown"
+        start_d = _parse_date(start_str)
+        try:
+            total_w = int(total_w)
+        except (ValueError, TypeError):
+            continue
+        if not start_d or total_w <= 0:
+            continue
+
+        end_d = start_d + timedelta(weeks=total_w)
+        prog_start_window = (start_d, start_d + timedelta(weeks=4))
+        prog_end_window = (end_d - timedelta(weeks=4), end_d)
+
+        gains = []
+        for pattern, _domain in key_patterns:
+            start_rm = _get_peak_1rm_in_range(*prog_start_window, pattern)
+            end_rm = _get_peak_1rm_in_range(*prog_end_window, pattern)
+            if start_rm and end_rm:
+                gains.append(f"{pattern} {start_rm:.0f}→{end_rm:.0f}kg ({end_rm-start_rm:+.0f})")
+
+        if gains:
+            history_lines.append(f"  {name} ({total_w}wk): " + " | ".join(gains))
+
+    # Current program comparison
+    current_lines = []
+    if current_program_info:
+        curr_start = _parse_date(current_program_info.get("start_date", ""))
+        curr_total = current_program_info.get("total_weeks", 0)
+        if curr_start and curr_total:
+            curr_start_window = (curr_start, curr_start + timedelta(weeks=4))
+            today = date.today()
+            for pattern, _domain in key_patterns:
+                start_rm = _get_peak_1rm_in_range(*curr_start_window, pattern)
+                curr_rm = _get_peak_1rm_in_range(today - timedelta(weeks=2), today, pattern)
+                if start_rm and curr_rm:
+                    weeks_in = (today - curr_start).days // 7
+                    current_lines.append(
+                        f"  {pattern}: {start_rm:.0f}→{curr_rm:.0f}kg ({curr_rm-start_rm:+.0f}kg in {weeks_in}wk)"
+                    )
+
+    lines = []
+    if current_lines:
+        lines.append("Current program gains so far:")
+        lines.extend(current_lines)
+    if history_lines:
+        lines.append("Historical program gains:")
+        lines.extend(history_lines)
+
+    return "\n".join(lines) if lines else ""
+
+
+# ---------------------------------------------------------------------------
 # Format for prompt injection
 # ---------------------------------------------------------------------------
 
@@ -318,6 +628,7 @@ def format_projections_for_prompt(
     lift_projections: list[dict],
     bw_projection: Optional[dict],
     program_projection: Optional[dict],
+    fatigue: Optional[dict] = None,
 ) -> str:
     """
     Convert computed projections into a compact text block for prompt injection.
@@ -380,6 +691,13 @@ def format_projections_for_prompt(
             line += f" | target {bw['target_bw']}kg projected {bw['target_date']}"
         lines.append(line)
 
+    if fatigue:
+        f = fatigue
+        flag = " ⚠ DELOAD RECOMMENDED" if f.get("deload_recommended") else ""
+        lines.append(
+            f"Fatigue: ATL={f['ATL']} CTL={f['CTL']} TSB={f['TSB']:+.1f} — {f['readiness']}{flag}"
+        )
+
     return "\n".join(lines) if lines else ""
 
 
@@ -390,14 +708,18 @@ def format_projections_for_prompt(
 def run_all_projections(
     memory_data: dict,
     program_info: dict = None,
+    program_data: dict = None,
 ) -> dict:
     """
     Run all projections from memory_data dict (output of memory.read_all()).
     program_info: optional dict with {start_date, total_weeks} from registry.
-    Returns: {lift_projections, bw_projection, program_projection, formatted_text}
+    program_data: optional output of sheets.read_program_data() for tonnage computation.
+    Returns: {lift_projections, bw_projection, program_projection, fatigue,
+              tonnage_by_lift, volume_spikes, cross_program, formatted_text}
     """
     lift_history = memory_data.get("lift_history", [])
     health_log = memory_data.get("health_log", [])
+    tracked_lifts = memory_data.get("tracked_lifts")
 
     # Determine program info
     if program_info is None:
@@ -426,7 +748,6 @@ def run_all_projections(
     goal_map = _parse_lift_targets(goals_text)
 
     # Get tracked lifts from memory_data (dynamic registry) — MAIN lifts only for projections
-    tracked_lifts = memory_data.get("tracked_lifts")
     if tracked_lifts:
         lifts_for_proj = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts
                           if tl.get("lift_type", "MAIN") == "MAIN"]
@@ -444,12 +765,41 @@ def run_all_projections(
     # Bodyweight
     bw_proj = project_bodyweight(health_log)
 
-    formatted = format_projections_for_prompt(lift_projections, bw_proj, program_proj)
+    # Fatigue model (ATL/CTL/TSB)
+    fatigue = None
+    try:
+        fatigue = compute_fatigue_model(lift_history)
+    except Exception:
+        pass
+
+    # Weekly tonnage + volume spike detection
+    tonnage_by_lift = {}
+    volume_spikes = []
+    if program_data:
+        try:
+            tonnage_by_lift = compute_weekly_tonnage(program_data, tracked_lifts=tracked_lifts)
+            volume_spikes = detect_volume_spikes(tonnage_by_lift)
+        except Exception:
+            pass
+
+    # Cross-program analytics
+    cross_program = ""
+    try:
+        program_registry = memory_data.get("sheet_registry", [])
+        cross_program = compare_program_progress(lift_history, program_registry, program_info)
+    except Exception:
+        pass
+
+    formatted = format_projections_for_prompt(lift_projections, bw_proj, program_proj, fatigue)
 
     return {
         "lift_projections": lift_projections,
         "bw_projection": bw_proj,
         "program_projection": program_proj,
+        "fatigue": fatigue,
+        "tonnage_by_lift": tonnage_by_lift,
+        "volume_spikes": volume_spikes,
+        "cross_program": cross_program,
         "formatted": formatted,
     }
 

@@ -17,5 +17,8 @@ python-telegram-bot>=20.0
 # PDF parsing (health data ingestion)
 pypdf>=4.0.0
 
+# Voice transcription (optional — needed for Whisper voice message support)
+openai>=1.0.0
+
 # Development (optional)
 pytest>=7.4.0

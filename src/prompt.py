@@ -783,7 +783,9 @@ def build_prompt(program_data: dict, memory_data: dict,
                  is_weekly_summary: bool = False,
                  plateau_deep_dives: dict = None,
                  projections_text: str = "",
-                 program_complete: bool = False) -> tuple[str, str]:
+                 program_complete: bool = False,
+                 tonnage_by_lift: dict = None,
+                 cross_program: str = "") -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -986,6 +988,23 @@ def build_prompt(program_data: dict, memory_data: dict,
     # --- Projections (computed facts — not hallucinated) ---
     if projections_text:
         sections.append(f"PROJECTIONS (computed — Python math, not estimated)\n{projections_text}")
+
+    # --- Weekly tonnage per lift (volume load tracking) ---
+    if tonnage_by_lift:
+        from projections import format_tonnage_for_prompt
+        tonnage_text = format_tonnage_for_prompt(tonnage_by_lift)
+        if tonnage_text:
+            sections.append(
+                "WEEKLY TONNAGE (kg lifted per lift — use to assess volume load and trends)\n"
+                + tonnage_text
+            )
+
+    # --- Cross-program analytics ---
+    if cross_program:
+        sections.append(
+            "CROSS-PROGRAM PROGRESS (1RM gains: this program vs history — "
+            "use for long-term perspective)\n" + cross_program
+        )
 
     # --- 1RM trajectory ---
     lift_history = memory_data.get("lift_history", [])
