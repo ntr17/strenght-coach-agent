@@ -93,8 +93,8 @@ def _build_bot_context() -> str:
         if focus_items:
             lines = []
             for item in focus_items[:12]:
-                tag = item.get("Type", "")
-                note = item.get("Note", "").strip()
+                tag = item.get("Category", "")
+                note = item.get("Item", "").strip()
                 priority = item.get("Priority", "")
                 badge = f"[{priority}] " if priority in ("HIGH", "PINNED") else ""
                 lines.append(f"  {badge}[{tag}] {note}")
