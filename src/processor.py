@@ -37,13 +37,26 @@ CATEGORIES:
                      FACT format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <ISO or 'unknown'>"
                      Include as many fields as can be extracted. Always extract date if mentioned (yesterday, last Tuesday, etc.)
                      Example: "exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-11"
+- MOOD_PERFORMANCE — qualitative notes about how a session felt, energy level during training, pain/discomfort
+                     during specific exercises, RPE estimates, mental state. Capture anything that affects
+                     how we interpret lift numbers. NOT pure health metrics (those are HEALTH_DATA).
+                     Examples: "felt weak today, squats moved slow", "elbow pain on last bench set",
+                     "energy was 6/10, slept poorly before", "RPE 9 on the last set — close to failure",
+                     "back felt tight, stopped after 3 sets", "strongest session in weeks"
 - TRACK_LIFT       — athlete wants to add or remove a lift as a tracked main/auxiliary lift
                      (phrases like "track X", "add X as main lift", "start monitoring X", "drop X from main lifts")
 - HEALTH_DATA      — athlete reports health metrics: lab values (blood test, ferritin, TSH, glucose, etc.),
-                     HRV, bodyweight, sleep hours, energy level, food quality, steps, resting HR, watch data,
-                     nutrition logs. The FACT should preserve all numeric values verbatim.
+                     HRV, bodyweight, sleep hours, energy level (out of workout context), food quality, steps,
+                     resting HR, watch data, nutrition logs. The FACT should preserve all numeric values verbatim.
                      Examples: "ferritin: 45 ng/mL, TSH: 2.1", "HRV 58, resting HR 52", "slept 7.5h, energy 8/10"
-- QUESTION         — athlete has a question or wants advice on something specific
+- PROGRAM_REQUEST  — athlete explicitly asks for a structural program change: new program, new block, deload week,
+                     comeback sessions, scaling weights after vacation/illness, next training cycle.
+                     This is DIFFERENT from a coaching question — it's a request to modify or create program structure.
+                     Examples: "I need a deload week", "design me the next block", "scale back my weights I've been away",
+                     "can we do comeback sessions?", "I'm ready for a new program"
+- QUESTION         — athlete has a coaching question or wants advice. NOT structural program changes.
+                     Examples: "why is my bench stalling?", "should I eat more on training days?",
+                     "how is my squat progressing?", "what's my estimated 1RM?"
 - NOISE            — chitchat, acknowledgment, emoji-only, irrelevant
 
 OUTPUT FORMAT (one line per extracted fact):
@@ -55,6 +68,8 @@ Rules:
 - One message can produce multiple lines (e.g. a message about skipping + asking a question = 2 lines)
 - NOISE lines are optional — only include them if useful to log
 - Do NOT include JSON, markdown, or any other format. Plain lines only.
+- Distinguish QUESTION (coaching advice request) from PROGRAM_REQUEST (structural change request)
+- Distinguish HEALTH_DATA (numeric metrics, resting state) from MOOD_PERFORMANCE (how training felt in-session)
 
 Examples:
 SCHEDULE_CHANGE | 2026-03-07 | Athlete skipped Day 3, no plan to make it up
@@ -64,12 +79,18 @@ LIFE_EVENT | 2026-03-07 | Athlete traveling Mon-Thu this week, training may be d
 PREFERENCE | 2026-03-06 | Athlete says weekly charts are not useful, prefers text only
 WORKOUT_UNPLANNED | 2026-03-05 | Athlete did spontaneous pull day with pull-ups and rows
 LIFT_UPDATE | 2026-03-07 | exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-07
+MOOD_PERFORMANCE | 2026-03-07 | Squats felt slow and heavy, energy low, stopped at set 3
+MOOD_PERFORMANCE | 2026-03-09 | Sharp elbow pain on last bench set, stopped early
+MOOD_PERFORMANCE | 2026-03-11 | Best session in weeks, everything moved fast, RPE 8
 TRACK_LIFT | 2026-03-07 | Athlete wants to track Romanian Deadlift as a main lift
 TRACK_LIFT | 2026-03-07 | Athlete wants to remove Dip from tracked lifts
 HEALTH_DATA | 2026-03-07 | ferritin: 45 ng/mL, TSH: 2.1 mU/L, glucose: 95 mg/dL
 HEALTH_DATA | 2026-03-07 | HRV: 58ms, resting HR: 52bpm, sleep: 7.5h
 HEALTH_DATA | 2026-03-07 | bodyweight: 83.2kg, food quality: 8/10, energy: 7/10
+PROGRAM_REQUEST | 2026-03-12 | Athlete wants comeback sessions after 2-week vacation
+PROGRAM_REQUEST | 2026-03-14 | Athlete asking for deload week after next heavy week
 QUESTION | 2026-03-07 | Athlete asks whether to add calories on training days
+QUESTION | 2026-03-10 | Athlete asks why bench press has been stalling for 3 weeks
 """
 
 
@@ -96,8 +117,8 @@ def _parse_processor_output(output: str) -> list[dict]:
 
         valid_categories = {
             "SCHEDULE_CHANGE", "PENDING_CATCHUP", "LIFE_EVENT", "PREFERENCE",
-            "WORKOUT_UNPLANNED", "LIFT_UPDATE", "TRACK_LIFT",
-            "HEALTH_DATA", "QUESTION", "NOISE",
+            "WORKOUT_UNPLANNED", "LIFT_UPDATE", "MOOD_PERFORMANCE", "TRACK_LIFT",
+            "HEALTH_DATA", "PROGRAM_REQUEST", "QUESTION", "NOISE",
         }
         if category not in valid_categories:
             continue
@@ -221,6 +242,37 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
                     "TRACKING",
                     f"[Health data logged via Telegram] {fact[:100]}",
                     last_mentioned=today,
+                )
+                dispatched += 1
+
+            elif cat == "MOOD_PERFORMANCE":
+                # How a session felt — important context for interpreting lift data.
+                # Stored in Coach Focus (TRACKING) + Life Context for long-term reference.
+                append_coach_focus(
+                    "TRACKING",
+                    f"[Session quality] {fact}",
+                    last_mentioned=event_date if event_date != "unknown" else today,
+                )
+                # If pain/injury keywords present, also flag as CONCERN
+                pain_keywords = ["pain", "hurt", "ache", "sharp", "swollen", "injury", "stopped early",
+                                 "dolor", "lesión", "paré"]
+                if any(kw in fact.lower() for kw in pain_keywords):
+                    append_coach_focus(
+                        "CONCERN",
+                        f"[Possible injury/pain] {fact}",
+                        last_mentioned=event_date if event_date != "unknown" else today,
+                        priority="HIGH",
+                    )
+                dispatched += 1
+
+            elif cat == "PROGRAM_REQUEST":
+                # Structural program change request — log as HIGH-priority FOLLOWUP
+                # so the coach sees it in the next email pass and can act on it.
+                append_coach_focus(
+                    "FOLLOWUP",
+                    f"[Program change requested] {fact}",
+                    last_mentioned=event_date if event_date != "unknown" else today,
+                    priority="HIGH",
                 )
                 dispatched += 1
 

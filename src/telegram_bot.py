@@ -403,7 +403,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         from program_agent import is_program_design_query, respond as program_respond
         if is_program_design_query(user_text):
-            await update.message.reply_text("On it — designing your program now. This takes about 30 seconds...")
+            await update.message.reply_text("Thinking about your program... give me 30 seconds.")
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id, action="typing"
             )
@@ -505,6 +505,28 @@ async def _extract_photo_text(file_bytes: bytes) -> str:
     return response.content[0].text
 
 
+def _infer_file_type(caption: str, fallback: str = "health_data") -> str:
+    """
+    Infer what kind of health data a file/photo contains based on the caption.
+    Returns a short string used as the file_type key in HealthAgent's extra_data dict.
+    """
+    if not caption:
+        return fallback
+    lower = caption.lower()
+    if any(w in lower for w in ["blood", "sangre", "analítica", "analitica", "lab", "ferritin",
+                                  "hemoglobin", "glucose", "cholesterol", "tsh", "creatinine"]):
+        return "blood_data"
+    if any(w in lower for w in ["hrv", "heart rate", "watch", "garmin", "oura", "whoop",
+                                  "sleep score", "recovery", "readiness"]):
+        return "hrv_data"
+    if any(w in lower for w in ["food", "meal", "nutrition", "macros", "calories", "comida",
+                                  "dieta", "proteína", "proteina"]):
+        return "nutrition_data"
+    if any(w in lower for w in ["photo", "picture", "foto", "progress", "body", "physique"]):
+        return "body_photo"
+    return fallback
+
+
 async def _handle_health_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                extracted_text: str, file_type: str,
                                caption: str = "") -> None:
@@ -586,7 +608,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Couldn't download the PDF: {e}")
         return
 
-    await _handle_health_file(update, context, extracted, "blood_data", caption)
+    await _handle_health_file(update, context, extracted, _infer_file_type(caption, "pdf"), caption)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -613,7 +635,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Couldn't read the photo: {e}")
         return
 
-    await _handle_health_file(update, context, extracted, "blood_data", caption)
+    await _handle_health_file(update, context, extracted, _infer_file_type(caption, "photo"), caption)
 
 
 # ---------------------------------------------------------------------------
