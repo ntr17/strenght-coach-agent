@@ -927,6 +927,39 @@ def transition_program(old_sheet_id: str, new_sheet_id: str, new_name: str,
                    start_date=new_start_date, total_weeks=total_weeks, notes=notes)
 
 
+def activate_pending_program() -> Optional[str]:
+    """
+    Transition flow when athlete confirms a newly created program:
+    - Sets all ACTIVE programs → COMPLETED
+    - Sets the most recent PENDING program → ACTIVE
+    Returns the name of the activated program, or None if no PENDING program found.
+    """
+    sheet = _get_memory_sheet()
+    ws = _get_tab(sheet, TAB_SHEET_REGISTRY)
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return None
+
+    headers = rows[0]
+    status_col = headers.index("Status") + 1  # 1-indexed
+
+    pending_row = None
+    pending_name = None
+    for i, row in enumerate(rows[1:], start=2):
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        status = entry.get("Status", "").upper().strip()
+        if status == "PENDING" and pending_row is None:
+            pending_row = i
+            pending_name = entry.get("Name", "New Program")
+        elif status == "ACTIVE":
+            ws.update_cell(i, status_col, "COMPLETED")
+
+    if pending_row:
+        ws.update_cell(pending_row, status_col, "ACTIVE")
+        return pending_name
+    return None
+
+
 def get_last_run_date() -> Optional[date]:
     """Return the date of the most recent coach run, from the Coach Log."""
     entries = read_coach_log(limit=1)
@@ -1195,12 +1228,15 @@ def append_life_context(context_note: str, context_date: Optional[date] = None) 
 
 
 def log_coach_run(observations: str, email_summary: str,
-                  run_date: Optional[date] = None) -> None:
-    """Log what the agent observed and sent today."""
+                  run_date: Optional[date] = None, cost_usd: float = 0.0) -> None:
+    """Log what the agent observed and sent today, including API cost."""
     sheet = _get_memory_sheet()
     ws = _get_tab(sheet, TAB_COACH_LOG)
     d = str(run_date or date.today())
-    ws.append_row([d, observations, email_summary])
+    obs = observations
+    if cost_usd:
+        obs = f"{observations} | cost: ${cost_usd:.4f}"
+    ws.append_row([d, obs, email_summary])
 
 
 def update_program_history(program_name: str, start_date: str,

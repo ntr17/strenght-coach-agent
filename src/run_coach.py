@@ -80,11 +80,11 @@ def generate_analysis(system_prompt: str, user_message: str) -> str:
             {"role": "user", "content": user_message + f"\n\n---\n\n{analysis_request}"}
         ]
     )
-    return message.content[0].text
+    return message.content[0].text, message.usage
 
 
-def generate_email(system_prompt: str, user_message: str, analysis: str = "") -> str:
-    """Send the prompt to Claude and return the email text."""
+def generate_email(system_prompt: str, user_message: str, analysis: str = "") -> tuple[str, object]:
+    """Send the prompt to Claude and return (email_text, usage)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     full_user_message = user_message
@@ -103,7 +103,17 @@ def generate_email(system_prompt: str, user_message: str, analysis: str = "") ->
         ]
     )
 
-    return message.content[0].text
+    return message.content[0].text, message.usage
+
+
+def _compute_cost(usage_list: list) -> float:
+    """Compute USD cost from a list of usage objects. Sonnet: $3/M in, $15/M out."""
+    total = 0.0
+    for u in usage_list:
+        if u:
+            total += (getattr(u, "input_tokens", 0) / 1_000_000 * 3.0)
+            total += (getattr(u, "output_tokens", 0) / 1_000_000 * 15.0)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +464,15 @@ def run_proactive(dry_run: bool = False):
         "health_log":          health_log,
     }
 
-    system_prompt, user_message = build_proactive_prompt(memory_data)
+    # Load current week so proactive pass knows what's scheduled today
+    program_data_p = None
+    try:
+        from sheets import read_program_data
+        program_data_p = read_program_data(week_num=compute_current_week(resolve_program_start_date()), lookback=0)
+    except Exception as e:
+        print(f"  Proactive: program load failed (non-fatal): {e}")
+
+    system_prompt, user_message = build_proactive_prompt(memory_data, program_data=program_data_p)
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
@@ -645,7 +663,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
     # 10. Analysis pass (reasoning before writing)
     print("  Running analysis pass...")
-    analysis = generate_analysis(system_prompt, user_message)
+    analysis, analysis_usage = generate_analysis(system_prompt, user_message)
     if dry_run:
         print("\n--- ANALYSIS ---")
         print(analysis)
@@ -653,7 +671,9 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
     # 9. Generate email
     print("  Generating email with Claude...")
-    email_text = generate_email(system_prompt, user_message, analysis=analysis)
+    email_text, email_usage = generate_email(system_prompt, user_message, analysis=analysis)
+    run_cost = _compute_cost([analysis_usage, email_usage])
+    print(f"  Email pipeline cost: ~${run_cost:.4f}")
 
     # 11. Extract output markers (Telegram alert + coach focus updates)
     email_text, tg_alert = extract_telegram_alert(email_text)
@@ -783,6 +803,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         log_coach_run(
             observations=first_sentence[:200],
             email_summary=email_text[:500],
+            cost_usd=run_cost,
         )
         print("  Run logged to Coach Memory.")
 

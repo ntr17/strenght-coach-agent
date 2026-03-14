@@ -979,28 +979,40 @@ def build_prompt(program_data: dict, memory_data: dict,
 # Proactive check-in prompt
 # ---------------------------------------------------------------------------
 
-def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
+def build_proactive_prompt(memory_data: dict, program_data: dict = None) -> tuple[str, str]:
     """
-    Build prompt for the proactive check-in pass (no email, no program data).
-    Claude reads compressed memory and decides whether to send a Telegram message.
+    Build prompt for the proactive check-in pass.
+    Claude reads memory + today's program schedule and decides whether to reach out.
     Returns (system_prompt, user_message).
     """
     from datetime import timedelta
 
     today = date.today()
+    weekday_name = today.strftime("%A")  # Monday, Tuesday, etc.
+    hour_utc = datetime.utcnow().hour
+    time_of_day = "morning" if hour_utc < 12 else "afternoon"
 
     system = (
-        f"You are {ATHLETE_NAME}'s strength coach. This is a brief autonomous check-in — "
-        "you're reasoning about whether to reach out via Telegram right now.\n\n"
-        "You have access to your compressed memory about the athlete's current situation.\n\n"
+        f"You are {ATHLETE_NAME}'s strength coach. This is an autonomous proactive check-in — "
+        "you decide whether to reach out via Telegram right now, and what to say.\n\n"
+        "You are the same coach who writes the daily email. Telegram is your primary real-time channel.\n\n"
+        "TRIGGER CONDITIONS (check these in order):\n"
+        "1. TRAINING DAY PREP (morning): If today is a scheduled training day and no session logged yet "
+        "→ send a brief prep message with today's prescribed exercises. Keep it punchy — 1-2 sentences.\n"
+        "2. SESSION FOLLOW-UP (afternoon): If today was a training day and session still not logged "
+        "→ ask how it went, what they actually did.\n"
+        "3. OPEN QUESTION (any time): If there's an unanswered OPEN_QUESTION more than 6 hours old "
+        "→ gently follow up. Don't be annoying — max once per question.\n"
+        "4. PLAN FLEXIBILITY (any time): If there's a PENDING_CATCHUP command (athlete planned to reschedule) "
+        "→ check in on whether it happened or needs adjusting.\n"
+        "5. GENERAL CHECK-IN: If you haven't heard from the athlete in 2+ days and no known break "
+        "→ brief check-in. Don't do this if you already sent a message today.\n\n"
         "Output rules:\n"
-        "- If you should send a message: write [TELEGRAM: your message] — 1-3 sentences, direct, not pushy\n"
-        "- If no outreach needed: write [PASS: one-sentence reason]\n"
+        "- [TELEGRAM: your message] — 1-3 sentences, direct, natural coach voice, not pushy\n"
+        "- [PASS: reason] — if no outreach needed right now\n"
         "- You may also include [FOLLOWUP: ...] or [TRACKING: ...] to update your watch list\n\n"
-        "Be selective. Don't reach out if you already sent a Telegram message today. "
-        "Don't be repetitive. If the athlete said they're on vacation until a specific date, respect it. "
-        "A brief check-in is appropriate if you haven't heard in several days and there's no known break scheduled. "
-        "Consider upcoming training, pending proposals, goal milestones, or anything worth flagging."
+        "Don't reach out if you already sent a Telegram message in the last few hours. "
+        "Don't repeat what was said in the last email unless it's genuinely relevant right now."
     )
 
     # Coach State
@@ -1053,7 +1065,26 @@ def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
         health_lines.append(" ".join(parts))
     health_text = "\n".join(f"  {l}" for l in health_lines) or "  (no recent health data)"
 
-    user_message = f"""TODAY: {today.strftime('%A, %B %d, %Y')}
+    # --- Today's program schedule (if program data provided) ---
+    today_schedule = ""
+    if program_data:
+        current_week = program_data.get("current_week", {})
+        days = current_week.get("days", [])
+        week_num = program_data.get("current_week_num", "?")
+        scheduled_lines = []
+        for day in days:
+            label = day.get("label", "")
+            exercises = day.get("exercises", [])
+            done_count = sum(1 for e in exercises if e.get("done") is True)
+            total_count = sum(1 for e in exercises if e.get("exercise") or e.get("name"))
+            scheduled_lines.append(
+                f"  {label}: {done_count}/{total_count} exercises logged"
+                + (" ✓" if total_count > 0 and done_count == total_count else "")
+            )
+        if scheduled_lines:
+            today_schedule = f"Week {week_num} schedule:\n" + "\n".join(scheduled_lines)
+
+    user_message = f"""TODAY: {today.strftime('%A, %B %d, %Y')} ({time_of_day})
 
 ## YOUR COMPRESSED KNOWLEDGE (Coach State)
 {state_text}
@@ -1061,17 +1092,21 @@ def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
 ## OPEN WATCH ITEMS (Coach Focus)
 {focus_text}
 
+## THIS WEEK'S PROGRAM SCHEDULE
+{today_schedule or "  (program data not loaded)"}
+
 ## RECENT HEALTH LOG (last 7 days)
 {health_text}
 
 ## RECENT TELEGRAM CONVERSATION (last 14 days)
 {tg_text}
 
-## ACTIVE COMMANDS
+## ACTIVE COMMANDS (includes PENDING_CATCHUP, OPEN_QUESTION, PENDING_PROPOSAL)
 {cmd_text}
 
 ---
-Should you reach out right now? Output [TELEGRAM: message] or [PASS: reason]."""
+Today is {weekday_name}. Time of day: {time_of_day}. Should you reach out right now?
+Check the trigger conditions. Output [TELEGRAM: message] or [PASS: reason]."""
 
     return system, user_message
 

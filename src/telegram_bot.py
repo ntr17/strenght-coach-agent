@@ -328,6 +328,23 @@ _TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "get_health_log",
+        "description": (
+            "Fetch the athlete's recent health log: bodyweight, sleep, energy, food quality, steps, notes. "
+            "Use for any health, recovery, nutrition, or body composition question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "How many days back to fetch (default 14, max 90).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "send_chart",
         "description": (
             "Generate and send a progress chart to the athlete via Telegram. "
@@ -503,6 +520,31 @@ def _tool_get_data_summary() -> str:
         return f"Could not load data summary: {e}"
 
 
+def _tool_get_health_log(days: int = 14) -> str:
+    """Return recent health log entries."""
+    from datetime import date as _date, timedelta
+    try:
+        from memory import read_health_log
+        days = min(days, 90)
+        cutoff = str(_date.today() - timedelta(days=days))
+        all_entries = read_health_log(limit=days + 10)
+        entries = [e for e in all_entries if e.get("Date", "") >= cutoff]
+        if not entries:
+            return f"No health log entries in the last {days} days."
+        lines = []
+        for e in entries:
+            parts = [f"[{e.get('Date','?')}]"]
+            if e.get("Bodyweight (kg)"): parts.append(f"BW:{e['Bodyweight (kg)']}kg")
+            if e.get("Sleep (hrs)"): parts.append(f"sleep:{e['Sleep (hrs)']}h")
+            if e.get("Food Quality (1-10)"): parts.append(f"food:{e['Food Quality (1-10)']}/10")
+            if e.get("Steps"): parts.append(f"steps:{e['Steps']}")
+            if e.get("Notes"): parts.append(f"note:{e['Notes'][:60]}")
+            lines.append("  " + " | ".join(parts))
+        return f"Health log (last {days} days, {len(entries)} entries):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Could not load health log: {e}"
+
+
 def _tool_log_lift(exercise: str, weight: str, sets_reps: str,
                    date_str: str = None, notes: str = "", completed: bool = True) -> str:
     """Append a lift session to Lift History with auto-computed Est 1RM."""
@@ -573,6 +615,8 @@ def _execute_data_tool(name: str, inp: dict) -> str:
                 inp.get("exercise", ""), inp.get("weight", ""), inp.get("sets_reps", ""),
                 inp.get("date"), inp.get("notes", ""), inp.get("completed", True)
             )
+        elif name == "get_health_log":
+            return _tool_get_health_log(inp.get("days", 14))
         elif name == "log_bodyweight":
             return _tool_log_bodyweight(inp.get("weight_kg", 0), inp.get("date"), inp.get("notes", ""))
         return f"Unknown tool: {name}"
@@ -594,8 +638,14 @@ async def _send_chart_tool(chart_type: str, chat_id: int, bot) -> str:
             health = read_health_log(limit=180)
             buf = generate_bodyweight_chart(health)
         elif chart_type == "volume":
-            # volume chart requires weekly data — skip for now
-            return "Volume chart requires parsed weekly data and isn't wired via tool yet. Try /chart 1rm or /chart bodyweight."
+            from sheets import read_program_data
+            from config import compute_current_week, resolve_program_start_date
+            week_num = compute_current_week(resolve_program_start_date())
+            program_data = read_program_data(week_num=week_num, lookback=6)
+            buf = generate_volume_chart(
+                program_data.get("recent_weeks", []),
+                program_data.get("current_week"),
+            )
         else:
             return f"Unknown chart type: {chart_type}"
 
@@ -673,6 +723,13 @@ async def _generate_response_with_tools(user_message: str, chat_id: int, bot,
             "Give specific advice: exact weights, sets/reps, substitutions if needed. "
             "Log what they actually did using log_lift if they report performance.\n\n"
         )
+    elif intent == "HEALTH":
+        focus_note = (
+            "The athlete is asking about health, recovery, nutrition, or body composition. "
+            "Call get_health_log first to see recent data (sleep, BW, energy, food quality). "
+            "Be specific — reference actual numbers if available. "
+            "Connect health signals to training impact. One insight + one action beats a list.\n\n"
+        )
     else:
         focus_note = ""
 
@@ -685,7 +742,7 @@ async def _generate_response_with_tools(user_message: str, chat_id: int, bot,
         "If the athlete is answering a question from the email, acknowledge it and move forward.\n\n"
         + focus_note +
         "Read tools: get_coach_brain, get_lift_history, get_program_week, list_programs, "
-        "get_projections, get_data_summary\n"
+        "get_projections, get_data_summary, get_health_log\n"
         "Write tools: log_lift (record a session), log_bodyweight (record weight)\n"
         "Visual: send_chart\n\n"
         "Rules:\n"
@@ -757,9 +814,18 @@ async def _generate_response_with_tools(user_message: str, chat_id: int, bot,
 
 
 def _log_token_cost(input_tokens: int, output_tokens: int, label: str = "") -> None:
-    """Print token usage. Sonnet pricing: $3/M input, $15/M output."""
+    """Print token usage and persist to Coach Log. Sonnet: $3/M in, $15/M out."""
     cost = (input_tokens / 1_000_000 * 3.0) + (output_tokens / 1_000_000 * 15.0)
     print(f"[Cost] {label} | in={input_tokens} out={output_tokens} | ~${cost:.4f}")
+    try:
+        from memory import log_coach_run
+        log_coach_run(
+            observations=f"[Telegram/{label}] in={input_tokens} out={output_tokens}",
+            email_summary="",
+            cost_usd=cost,
+        )
+    except Exception:
+        pass  # non-fatal — cost logging must never break the bot
 
 
 async def _process_incoming_message_background() -> None:
@@ -827,16 +893,27 @@ def _get_pending_proposals() -> list[dict]:
         return []
 
 
-def _resolve_proposal(row_index: int, decision: str, proposal_text: str) -> None:
-    """Mark proposal applied/declined and log to Coach Focus."""
+def _resolve_proposal(row_index: int, decision: str, proposal_text: str) -> str:
+    """Mark proposal applied/declined, handle program activation, log to Coach Focus."""
+    extra = ""
     try:
         from memory import mark_command_applied, append_coach_focus
         if decision == "Y":
-            # mark_command_applied sets Applied = "Y"
             mark_command_applied(row_index)
             append_coach_focus("LANDMARK", f"[Confirmed via Telegram] {proposal_text}")
+            # If this looks like a new program creation, activate it
+            lower = proposal_text.lower()
+            if any(kw in lower for kw in ("created", "new program", "activate", "weeks,")):
+                try:
+                    from memory import activate_pending_program
+                    name = activate_pending_program()
+                    if name:
+                        extra = f"\n\nProgram **{name}** is now ACTIVE. Old program marked COMPLETED."
+                        append_coach_focus("LANDMARK", f"[Program activated] {name} → ACTIVE")
+                        print(f"  [ProgramTransition] Activated: {name}")
+                except Exception as e:
+                    print(f"  [ProgramTransition] Failed (non-fatal): {e}")
         else:
-            # Write DECLINED directly
             from memory import _get_memory_sheet, TAB_COMMANDS, COMMANDS_HEADERS
             sheet = _get_memory_sheet()
             ws = sheet.worksheet(TAB_COMMANDS)
@@ -845,6 +922,7 @@ def _resolve_proposal(row_index: int, decision: str, proposal_text: str) -> None
             append_coach_focus("LANDMARK", f"[Declined via Telegram] {proposal_text}")
     except Exception as e:
         print(f"[Telegram] Proposal resolution failed (non-fatal): {e}")
+    return extra
 
 
 async def _handle_confirmation(update: Update, user_text: str) -> bool:
@@ -869,7 +947,7 @@ async def _handle_confirmation(update: Update, user_text: str) -> bool:
         row_index = p.get("_row_index")
 
         if is_yes:
-            _resolve_proposal(row_index, "Y", proposal_text)
+            transition_msg = _resolve_proposal(row_index, "Y", proposal_text)
 
             # Attempt write-back immediately
             wb_msg = ""
@@ -889,9 +967,7 @@ async def _handle_confirmation(update: Update, user_text: str) -> bool:
                 wb_msg = " (Sheet update failed — please update manually.)"
                 print(f"  [WriteBack] Error: {e}")
 
-            reply = (
-                f"Confirmed.{wb_msg} I'll reference this in the next email."
-            )
+            reply = f"Confirmed.{wb_msg} I'll reference this in the next email.{transition_msg}"
         else:
             _resolve_proposal(row_index, "DECLINED", proposal_text)
             reply = "Understood, I won't make that change."
@@ -1108,15 +1184,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             print(f"[ProgramDesigner] Failed (falling back): {e}")
 
     elif intent == "HEALTH":
-        ctx = _build_bot_context()
         try:
-            from health_agent import respond as health_respond
-            response = health_respond(user_text, ctx)
+            response = await _generate_response_with_tools(
+                user_text, update.effective_chat.id, context.bot, intent="HEALTH"
+            )
             await update.message.reply_text(response)
             _log_message("OUT", response)
             return
         except Exception as e:
-            print(f"[HealthAgent] Failed (falling back): {e}")
+            print(f"[HealthToolUse] Failed (falling back): {e}")
 
     elif intent == "WORKOUT":
         try:
