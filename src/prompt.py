@@ -163,8 +163,35 @@ def _summarize_week(week_data: dict) -> str:
     return "\n".join(parts)
 
 
-def _format_current_week(week_data: dict) -> str:
-    """Detailed view of the current week so far."""
+def _extract_catchup_day_map(commands: list) -> dict:
+    """
+    Build a day-number → catch-up-plan map from PENDING_CATCHUP commands.
+    E.g. {3: "planned for 2026-03-16"} means Day 3 has a confirmed catch-up intent.
+    Only includes unapplied commands.
+    """
+    import re as _re
+    result = {}
+    for cmd in commands:
+        if cmd.get("Command", "").upper() != "PENDING_CATCHUP":
+            continue
+        if cmd.get("Applied", "").upper() in ("Y", "DECLINED"):
+            continue
+        value = cmd.get("Value", "")
+        # Expected format: "Week N Day D → planned for ..."
+        day_match = _re.search(r"day\s*(\d+)", value, _re.I)
+        planned_match = _re.search(r"→\s*(.+)", value)
+        if day_match:
+            day_num = int(day_match.group(1))
+            planned = planned_match.group(1).strip() if planned_match else "catch-up planned"
+            result[day_num] = planned
+    return result
+
+
+def _format_current_week(week_data: dict, catchup_map: dict = None) -> str:
+    """
+    Detailed view of the current week so far.
+    catchup_map: {day_number: 'planned for ...'} from PENDING_CATCHUP commands.
+    """
     if not week_data:
         return "No current week data."
 
@@ -176,9 +203,19 @@ def _format_current_week(week_data: dict) -> str:
         date_str = f" [{_fmt_date(day['date'])}]" if day.get("date") else " [date unknown]"
         exercises = day.get("exercises", [])
 
+        # Extract day number from label ("DAY 1: ..." → 1)
+        import re as _re
+        day_num_match = _re.search(r"day\s*(\d+)", label, _re.I)
+        day_num = int(day_num_match.group(1)) if day_num_match else None
+
         all_none = all(e.get("done") is None for e in exercises)
         if all_none:
-            lines.append(f"  {label}{date_str}: Not done yet")
+            # Check for a known catch-up intent for this day
+            catchup_note = (catchup_map or {}).get(day_num, "") if day_num else ""
+            if catchup_note:
+                lines.append(f"  {label}{date_str}: ⏳ {catchup_note}")
+            else:
+                lines.append(f"  {label}{date_str}: Not done yet")
             continue
 
         lines.append(f"  {label}{date_str}:")
@@ -850,7 +887,8 @@ def build_prompt(program_data: dict, memory_data: dict,
     sections.append(f"PROGRAM TARGETS\n{trajectory}")
 
     # --- Current week (full detail) ---
-    current_week_text = _format_current_week(current_week) if current_week else "No current week data."
+    catchup_map = _extract_catchup_day_map(memory_data.get("commands", []))
+    current_week_text = _format_current_week(current_week, catchup_map=catchup_map) if current_week else "No current week data."
     sections.append(f"THIS WEEK\n{current_week_text}")
 
     # --- Previous week carryover (if any recent sessions from last week) ---

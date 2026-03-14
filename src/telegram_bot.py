@@ -490,13 +490,35 @@ async def _handle_health_file(update: Update, context: ContextTypes.DEFAULT_TYPE
                                caption: str = "") -> None:
     """
     Common handler: given extracted text from a PDF/photo, call HealthAgent and reply.
+    Also persists the raw extracted data to the Health Log for future reference.
     """
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
 
+    from datetime import date as _date
+    today = str(_date.today())
+
+    # Persist extracted data to Health Log + Coach Focus
+    try:
+        from memory import append_health_log, append_coach_focus
+        # Store full extracted text in Notes; flag file type in the entry
+        source_label = "PDF" if file_type == "blood_data" and "pdf" in file_type.lower() else file_type.upper()
+        append_health_log([{
+            "date": today,
+            "notes": f"[{source_label} upload] {extracted_text[:500]}",
+        }])
+        append_coach_focus(
+            "TRACKING",
+            f"[Health file uploaded {today}] {file_type}: {extracted_text[:120]}",
+            last_mentioned=today,
+        )
+        print(f"[Telegram] Health data persisted to Health Log ({len(extracted_text)} chars)")
+    except Exception as e:
+        print(f"[Telegram] Health data persist failed (non-fatal): {e}")
+
     # Use caption as the user's question (if any), otherwise a generic prompt
-    user_question = caption.strip() if caption else f"Here's my {file_type} data."
+    user_question = caption.strip() if caption else f"Here's my {file_type} data — what do you see?"
     _log_message("IN", f"[{file_type.upper()} upload] {caption or '(no caption)'}")
 
     ctx = _build_bot_context()

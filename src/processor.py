@@ -26,11 +26,17 @@ You receive raw Telegram messages from the athlete. Your job is to extract struc
 For each message (or cluster of related messages), output one or more structured lines.
 
 CATEGORIES:
-- SCHEDULE_CHANGE  — workout skipped, rescheduled, or upcoming disruption
+- SCHEDULE_CHANGE  — workout definitively skipped/missed with no plan to make it up
+- PENDING_CATCHUP  — athlete plans to do a session on a different day ("will train Monday instead",
+                     "catching up tomorrow", "doing it Wednesday"). Extract the intended day/date if mentioned.
+                     FACT format: "Week N Day D → planned for [day/date]", e.g. "Week 9 Day 3 → Monday 2026-03-16"
 - LIFE_EVENT       — travel, stress, illness, injury, life change that affects training
 - PREFERENCE       — athlete feedback about coaching output (charts, email length, topics)
 - WORKOUT_UNPLANNED — unplanned/spontaneous session not on the program
-- LIFT_UPDATE      — athlete reports a specific weight, set, PR, or performance
+- LIFT_UPDATE      — athlete reports a specific weight, set, PR, or performance.
+                     FACT format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <ISO or 'unknown'>"
+                     Include as many fields as can be extracted. Always extract date if mentioned (yesterday, last Tuesday, etc.)
+                     Example: "exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-11"
 - TRACK_LIFT       — athlete wants to add or remove a lift as a tracked main/auxiliary lift
                      (phrases like "track X", "add X as main lift", "start monitoring X", "drop X from main lifts")
 - HEALTH_DATA      — athlete reports health metrics: lab values (blood test, ferritin, TSH, glucose, etc.),
@@ -51,11 +57,13 @@ Rules:
 - Do NOT include JSON, markdown, or any other format. Plain lines only.
 
 Examples:
-SCHEDULE_CHANGE | 2026-03-07 | Athlete skipped Day 3 due to late flight from Madrid
+SCHEDULE_CHANGE | 2026-03-07 | Athlete skipped Day 3, no plan to make it up
+PENDING_CATCHUP | 2026-03-11 | Week 9 Day 2 → planned for 2026-03-13 (Thursday)
+PENDING_CATCHUP | 2026-03-11 | Week 9 Day 3 → planned for Monday (date unknown)
 LIFE_EVENT | 2026-03-07 | Athlete traveling Mon-Thu this week, training may be disrupted
 PREFERENCE | 2026-03-06 | Athlete says weekly charts are not useful, prefers text only
 WORKOUT_UNPLANNED | 2026-03-05 | Athlete did spontaneous pull day with pull-ups and rows
-LIFT_UPDATE | 2026-03-07 | Athlete hit 100kg squat x3 in an unplanned session
+LIFT_UPDATE | 2026-03-07 | exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-07
 TRACK_LIFT | 2026-03-07 | Athlete wants to track Romanian Deadlift as a main lift
 TRACK_LIFT | 2026-03-07 | Athlete wants to remove Dip from tracked lifts
 HEALTH_DATA | 2026-03-07 | ferritin: 45 ng/mL, TSH: 2.1 mU/L, glucose: 95 mg/dL
@@ -87,7 +95,7 @@ def _parse_processor_output(output: str) -> list[dict]:
         fact = "|".join(parts[2:]).strip()  # fact may contain | characters
 
         valid_categories = {
-            "SCHEDULE_CHANGE", "LIFE_EVENT", "PREFERENCE",
+            "SCHEDULE_CHANGE", "PENDING_CATCHUP", "LIFE_EVENT", "PREFERENCE",
             "WORKOUT_UNPLANNED", "LIFT_UPDATE", "TRACK_LIFT",
             "HEALTH_DATA", "QUESTION", "NOISE",
         }
@@ -141,6 +149,20 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
                 append_coach_focus("FOLLOWUP", fact, last_mentioned=today)
                 dispatched += 1
 
+            elif cat == "PENDING_CATCHUP":
+                # Athlete plans to do a session on a different day.
+                # Stored in Commands as PENDING_CATCHUP so the prompt can display
+                # the session as "⏳ catch-up planned" instead of "not done / missed".
+                from memory import append_command
+                append_command("PENDING_CATCHUP", fact)
+                append_coach_focus(
+                    "FOLLOWUP",
+                    f"[Catch-up planned] {fact}",
+                    last_mentioned=today,
+                    priority="HIGH",
+                )
+                dispatched += 1
+
             elif cat == "LIFE_EVENT":
                 # Goes to Life Context (permanent record) + FOLLOWUP in Coach Focus
                 append_life_context(fact, event_date if event_date != "unknown" else today)
@@ -160,8 +182,20 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
                 dispatched += 1
 
             elif cat == "LIFT_UPDATE":
-                # Flag as LANDMARK for coach awareness; coach may want to log to lift history
-                append_coach_focus("LANDMARK", f"[Lift update via Telegram] {fact}", last_mentioned=today)
+                # Try to parse structured LIFT_UPDATE fact and write to Lift History.
+                # Falls back to Coach Focus LANDMARK if fact is unstructured.
+                parsed = _parse_lift_update_fact(fact, today)
+                if parsed:
+                    from memory import append_lift_history
+                    append_lift_history([parsed])
+                    append_coach_focus(
+                        "LANDMARK",
+                        f"[Lift logged via Telegram] {parsed['exercise_name']} "
+                        f"{parsed.get('actual', '')} on {parsed['date']}",
+                        last_mentioned=today,
+                    )
+                else:
+                    append_coach_focus("LANDMARK", f"[Lift update via Telegram] {fact}", last_mentioned=today)
                 dispatched += 1
 
             elif cat == "TRACK_LIFT":
@@ -203,6 +237,114 @@ def _dispatch_events(events: list[dict], dry_run: bool = False) -> int:
             print(f"    [Processor] Dispatch failed for {cat}: {exc}")
 
     return dispatched
+
+
+def _normalize_date(date_str: str, reference_date: str = None) -> str:
+    """
+    Normalize a date string to ISO format (YYYY-MM-DD).
+    Handles ISO dates, day names, relative expressions ("yesterday", "last Tuesday").
+    Falls back to reference_date (today) if parsing fails.
+    """
+    import re as _re
+    from datetime import date as _date, timedelta as _td
+
+    today = _date.fromisoformat(reference_date) if reference_date else _date.today()
+
+    if not date_str or date_str.lower() in ("unknown", "today", ""):
+        return str(today)
+
+    # Already ISO
+    if _re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+        return date_str[:10]
+
+    # "yesterday"
+    if "yesterday" in date_str.lower():
+        return str(today - _td(days=1))
+
+    # Day names: "Monday", "last Tuesday", "el martes", etc.
+    day_names = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+        "lunes": 0, "martes": 1, "miércoles": 2, "miercoles": 2,
+        "jueves": 3, "viernes": 4, "sábado": 5, "sabado": 5, "domingo": 6,
+    }
+    for name, weekday in day_names.items():
+        if name in date_str.lower():
+            days_back = (today.weekday() - weekday) % 7
+            if days_back == 0:
+                days_back = 7  # "last Monday" when today is Monday → 7 days ago
+            return str(today - _td(days=days_back))
+
+    # "26 march", "march 26", "26/3", "3/26"
+    month_names = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+        "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+    }
+    for month_name, month_num in month_names.items():
+        if month_name in date_str.lower():
+            day_match = _re.search(r"\b(\d{1,2})\b", date_str)
+            if day_match:
+                try:
+                    from datetime import datetime as _dt
+                    year = today.year
+                    candidate = _dt(year, month_num, int(day_match.group(1))).date()
+                    if candidate > today:
+                        candidate = _dt(year - 1, month_num, int(day_match.group(1))).date()
+                    return str(candidate)
+                except ValueError:
+                    pass
+
+    return str(today)  # fallback
+
+
+def _parse_lift_update_fact(fact: str, today: str) -> dict | None:
+    """
+    Parse a structured LIFT_UPDATE fact into a Lift History entry dict.
+    Expected format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <date>"
+    Returns None if the fact doesn't contain enough data to log.
+    """
+    import re as _re
+
+    # Parse pipe-separated key:value pairs
+    fields = {}
+    for part in fact.split("|"):
+        kv = part.strip().split(":", 1)
+        if len(kv) == 2:
+            fields[kv[0].strip().lower()] = kv[1].strip()
+
+    exercise = fields.get("exercise", "").strip()
+    weight = fields.get("weight", "").strip()
+    sets_reps = fields.get("sets_reps", "").strip()
+    date_raw = fields.get("date", "unknown").strip()
+
+    # Need at least exercise + weight to be worth logging
+    if not exercise or not weight:
+        return None
+
+    # Normalize weight (strip "kg", commas)
+    weight_clean = _re.sub(r"[^\d.]", "", weight.replace(",", "."))
+    if not weight_clean:
+        return None
+
+    actual_str = f"{weight_clean}kg"
+    if sets_reps:
+        actual_str += f" {sets_reps}"
+
+    normalized_date = _normalize_date(date_raw, today)
+
+    return {
+        "date": normalized_date,
+        "exercise_name": exercise,
+        "actual": actual_str,
+        "prescribed_weight": weight_clean,
+        "sets_reps": sets_reps,
+        "completed": True,
+        "notes": f"[Logged via Telegram on {today}]",
+        "week": "",
+        "day_label": "Telegram",
+    }
 
 
 def _parse_health_data_fact(fact: str, entry_date: str) -> dict:
