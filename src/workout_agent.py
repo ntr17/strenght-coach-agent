@@ -118,7 +118,7 @@ def respond(user_message: str, base_context: str) -> str:
 ## ATHLETE CONTEXT (history, goals, current levels)
 {base_context}"""
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,  # Sonnet — this warrants full reasoning
         max_tokens=500,

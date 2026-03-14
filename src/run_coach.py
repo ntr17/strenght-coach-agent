@@ -456,7 +456,7 @@ def run_proactive(dry_run: bool = False):
 
     system_prompt, user_message = build_proactive_prompt(memory_data)
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=400,

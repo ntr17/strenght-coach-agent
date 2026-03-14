@@ -496,7 +496,7 @@ def respond(user_message: str, base_context: str, memory_data: dict = None,
         try:
             from config import resolve_program_start_date
             from datetime import date as _date, timedelta
-            start = resolve_program_start_date(memory_data)
+            start = resolve_program_start_date()
             start_dt = _date.fromisoformat(start) if start else None
             if start_dt:
                 current_week = max(1, (((_date.today() - start_dt).days) // 7) + 1)
