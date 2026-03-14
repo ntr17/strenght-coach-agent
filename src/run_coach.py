@@ -608,7 +608,16 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         if new_health:
             print(f"    → {len(new_health)} new health entries logged")
 
-    # 8. Build prompt (initial pass, without plateau dives)
+    # 8. Override telegram_log with entries since last email (email should see full dialogue)
+    if last_run_date:
+        try:
+            from memory import read_telegram_log_since
+            memory_data["telegram_log"] = read_telegram_log_since(last_run_date)
+            print(f"    → {len(memory_data['telegram_log'])} Telegram message(s) since last email")
+        except Exception as e:
+            print(f"  Telegram log filter failed (non-fatal): {e}")
+
+    # 8b. Build prompt (initial pass, without plateau dives)
     print("  Building prompt...")
     system_prompt, user_message = build_prompt(
         program_data, memory_data,
@@ -659,6 +668,25 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         elif dry_run:
             for u in focus_updates:
                 print(f"    [DRY RUN] {u['category']}: {u['item'][:80]}")
+
+    # Bridge FOLLOWUP questions to Telegram + log as OPEN_QUESTION for cross-channel tracking
+    followup_questions = [
+        u["item"] for u in focus_updates
+        if u["category"] == "FOLLOWUP" and "?" in u["item"]
+    ]
+    if followup_questions:
+        for q in followup_questions:
+            print(f"  [Question bridge → Telegram]: {q[:70]}")
+            if not dry_run and not no_sync:
+                try:
+                    from memory import log_open_question
+                    from telegram_utils import send_telegram_message
+                    log_open_question(q, source="EMAIL")
+                    send_telegram_message(q)
+                except Exception as e:
+                    print(f"    Question bridge failed (non-fatal): {e}")
+            elif dry_run:
+                print(f"    [DRY RUN] Would send to Telegram + log as OPEN_QUESTION")
 
     # 12. Check for write-back proposals — log to Commands so they persist
     proposal = check_for_write_back_proposals(email_text)
@@ -735,6 +763,19 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         week_num=week_num,
         dry_run=dry_run or no_sync,
     )
+
+    # Write LAST_EMAIL domain so Telegram bot knows what was said and what was asked
+    if not dry_run and not no_sync:
+        try:
+            from memory import upsert_coach_state
+            email_digest = email_text[:300].replace("\n", " ").strip()
+            if followup_questions:
+                asked = " | Asked: " + "; ".join(followup_questions[:3])
+                email_digest = email_digest[:250] + asked
+            upsert_coach_state("LAST_EMAIL", email_digest, "HIGH")
+            print("  LAST_EMAIL Coach State written.")
+        except Exception as e:
+            print(f"  LAST_EMAIL state write failed (non-fatal): {e}")
 
     # 16. Log the run to Coach Memory
     if not no_sync and not dry_run:

@@ -436,6 +436,45 @@ def read_telegram_log(limit: int = 10) -> list[dict]:
     return entries[-limit:]
 
 
+def read_telegram_log_since(since_date: date, limit: int = 100) -> list[dict]:
+    """Read Telegram log entries on or after since_date. Used by email pipeline."""
+    sheet = _get_memory_sheet()
+    try:
+        ws = sheet.worksheet(TAB_TELEGRAM_LOG)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    entries = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        entry = dict(zip(headers, row + [""] * (len(headers) - len(row))))
+        try:
+            row_date = datetime.strptime(entry.get("Date", ""), "%Y-%m-%d").date()
+            if row_date >= since_date:
+                entries.append(entry)
+        except (ValueError, TypeError):
+            pass
+    return entries[-limit:]
+
+
+def log_open_question(question: str, source: str = "EMAIL") -> None:
+    """Log an unanswered question to Commands tab so both channels can track it."""
+    append_command("OPEN_QUESTION", f"[{source}] {question}")
+
+
+def get_open_questions() -> list[dict]:
+    """Return unanswered OPEN_QUESTION commands."""
+    return [
+        c for c in read_commands()
+        if c.get("Command", "").upper() == "OPEN_QUESTION"
+        and c.get("Applied", "").upper() not in ("Y", "DECLINED")
+    ]
+
+
 def read_coach_focus(status_filter: str = "OPEN") -> list[dict]:
     """
     Read Coach Focus entries. status_filter=None returns all, 'OPEN' returns only active items.

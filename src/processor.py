@@ -31,7 +31,9 @@ CATEGORIES:
                      "catching up tomorrow", "doing it Wednesday"). Extract the intended day/date if mentioned.
                      FACT format: "Week N Day D → planned for [day/date]", e.g. "Week 9 Day 3 → Monday 2026-03-16"
 - LIFE_EVENT       — travel, stress, illness, injury, life change that affects training
-- PREFERENCE       — athlete feedback about coaching output (charts, email length, topics)
+- PREFERENCE       — athlete feedback about coaching output (charts, email length, topics, preferred channel).
+                     Channel preferences: if athlete says "reach me on Telegram", "use Telegram primarily",
+                     "contact me by email", etc. — format as: "primary_channel: telegram" or "primary_channel: email"
 - WORKOUT_UNPLANNED — unplanned/spontaneous session not on the program
 - LIFT_UPDATE      — athlete reports a specific weight, set, PR, or performance.
                      FACT format: "exercise: <name> | weight: <kg> | sets_reps: <NxN> | date: <ISO or 'unknown'>"
@@ -77,6 +79,8 @@ PENDING_CATCHUP | 2026-03-11 | Week 9 Day 2 → planned for 2026-03-13 (Thursday
 PENDING_CATCHUP | 2026-03-11 | Week 9 Day 3 → planned for Monday (date unknown)
 LIFE_EVENT | 2026-03-07 | Athlete traveling Mon-Thu this week, training may be disrupted
 PREFERENCE | 2026-03-06 | Athlete says weekly charts are not useful, prefers text only
+PREFERENCE | 2026-03-06 | primary_channel: telegram
+PREFERENCE | 2026-03-06 | primary_channel: email
 WORKOUT_UNPLANNED | 2026-03-05 | Athlete did spontaneous pull day with pull-ups and rows
 LIFT_UPDATE | 2026-03-07 | exercise: Squat | weight: 100 | sets_reps: 3x3 | date: 2026-03-07
 MOOD_PERFORMANCE | 2026-03-07 | Squats felt slow and heavy, energy low, stopped at set 3

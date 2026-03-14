@@ -26,16 +26,22 @@ You have your own agenda. You push on things he's not paying attention to — VO
 
 You think in years. Today is one data point. You have a roadmap for where he's going — the next program, the phase after that, the real target. You surface this context when it matters, not every day.
 
+**Channels — you are one coach, two surfaces:**
+Telegram is the primary coaching channel — real-time, conversational, direct. Email is the daily digest — the structured check-in with data, trend analysis, and anything that needs context. When the athlete talks to you on Telegram, that IS coaching. When you write the email, you've already read everything from Telegram since the last email. Don't repeat what was already covered. Build on it.
+
+The athlete can shift channels at any time: "reach me on Telegram", "send program updates to email", "don't ask me questions by email". Respect it. Log it. If a CHANNEL preference is active, honour it in every output decision. If no preference is set, use both channels as intended: Telegram for real-time dialogue, email for daily structure.
+
 **Output markers** (stripped before athlete sees them — update your internal state):
 - [TRACKING: description] — start watching something new (OPEN concern)
 - [LANDMARK: description] — log an important event (PR, milestone, injury, decision)
-- [FOLLOWUP: what to check next time] — remind yourself to follow up
+- [FOLLOWUP: question?] — a question you want answered. If it ends with "?", it will be sent to Telegram automatically. Don't ask the same question twice across channels.
 - [RESOLVED: text matching what you were tracking] — close an open item
-- [TELEGRAM: brief message] — send a proactive Telegram alert
+- [TELEGRAM: brief message] — send a proactive Telegram message right now (alerts, reactions, quick check-ins)
 
 **Email format:**
 - Natural prose. No section headers. No bullet lists unless they genuinely help.
 - Length matches relevance: nothing happened = 2 sentences; real data + question + trend = several paragraphs.
+- If the athlete prefers Telegram for coaching dialogue, keep the email short — data summary and one key point. Save the conversation for Telegram.
 - Don't recite the data. Interpret it. Tell him what it means.
 - Tone: someone who knows him well and doesn't waste his time. Warm, direct, not gushing.
 - Never change the program without asking. Proposal format: "One thing: [proposal]. Want me to update the sheet?"
@@ -573,12 +579,20 @@ def _format_active_commands(commands: list[dict]) -> str:
         else:
             other.append(c)
 
+    open_questions = [c for c in other if c.get("Command", "").upper() == "OPEN_QUESTION"]
+    other_cmds = [c for c in other if c.get("Command", "").upper() != "OPEN_QUESTION"]
+
     if proposals:
         lines.append("  AWAITING ATHLETE CONFIRMATION (check replies above):")
         for c in proposals:
             lines.append(f"    → {c.get('Value', '')}")
 
-    for c in other:
+    if open_questions:
+        lines.append("  OPEN QUESTIONS (you asked — check if athlete answered on Telegram or email):")
+        for c in open_questions:
+            lines.append(f"    ? {c.get('Value', '')}")
+
+    for c in other_cmds:
         line = f"  {c.get('Command', '')} | {c.get('Value', '')}"
         if c.get("Expires"):
             line += f" | expires: {c['Expires']}"
@@ -863,11 +877,29 @@ def build_prompt(program_data: dict, memory_data: dict,
                 "Use this to inform today's message. Surface relevant parts naturally — only when it matters."
             )
 
-    # --- Recent Telegram conversation ---
+    # --- Recent Telegram conversation (since last email — this is your dialogue, don't repeat it) ---
     telegram_log = memory_data.get("telegram_log", [])
     if telegram_log:
         tg_text = _format_telegram_log(telegram_log)
-        sections.append(f"RECENT TELEGRAM CONVERSATION\n{tg_text}")
+        since_label = f" since {last_run_date}" if last_run_date else ""
+        sections.append(
+            f"RECENT TELEGRAM CONVERSATION{since_label} "
+            f"(this is already part of the coaching relationship — build on it, don't repeat it)\n"
+            + tg_text
+        )
+
+    # --- Channel preference: if athlete wants Telegram-first, signal to keep email short ---
+    athlete_prefs = memory_data.get("athlete_preferences", [])
+    for pref in athlete_prefs:
+        val = pref.get("Preference", "").lower()
+        if "primary_channel" in val and "telegram" in val:
+            sections.append(
+                "CHANNEL PREFERENCE: athlete prefers Telegram as primary coaching channel. "
+                "Keep this email focused — key data and one main point only. "
+                "Ask questions via [FOLLOWUP: question?] so they route to Telegram. "
+                "Don't repeat things already covered in Telegram above."
+            )
+            break
 
     # --- Projections (computed facts — not hallucinated) ---
     if projections_text:
