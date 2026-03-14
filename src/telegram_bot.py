@@ -65,73 +65,76 @@ def _choose_model(message_text: str) -> str:
 
 def _build_bot_context() -> str:
     """
-    Build a rich context string for the bot: recent Telegram history + brief memory summary.
-    Kept lightweight — the bot needs to respond fast.
+    Build a rich context string for the bot — same Tier-1 brain as the daily email coach.
+    Reads Coach State, Coach Focus, Athlete Preferences, Lift History, and recent Telegram log.
     """
     try:
         from memory import (
             read_telegram_log, read_athlete_profile, read_long_term_goals,
-            read_lift_history, read_strategic_plan, read_planning_notes,
-            get_last_run_date,
+            read_lift_history, read_coach_state, read_coach_focus,
+            read_athlete_preferences, read_commands, read_tracked_lifts,
         )
 
         sections = []
 
-        # Recent Telegram conversation (last 10 messages for context)
-        tg_log = read_telegram_log(limit=10)
-        if tg_log:
+        # --- Tier 1: Coach State (compressed domain summaries — the coach's brain) ---
+        coach_state = read_coach_state()
+        if coach_state:
             lines = []
-            for entry in tg_log:
-                direction = entry.get("Direction", "")
-                msg = entry.get("Message", "").strip()
-                d = entry.get("Date", "")
-                label = ATHLETE_NAME if direction == "IN" else "Coach"
-                lines.append(f"  [{d}] {label}: {msg}")
-            sections.append("RECENT CONVERSATION\n" + "\n".join(lines))
+            for domain, data in coach_state.items():
+                summary = data.get("summary", "").strip()
+                if summary:
+                    lines.append(f"  [{domain}] {summary}")
+            if lines:
+                sections.append("COACH STATE (current understanding per domain)\n" + "\n".join(lines))
 
-        # Athlete profile (brief)
+        # --- Tier 1: Coach Focus (open watch items) ---
+        focus_items = read_coach_focus(status_filter="OPEN")
+        if focus_items:
+            lines = []
+            for item in focus_items[:12]:
+                tag = item.get("Type", "")
+                note = item.get("Note", "").strip()
+                priority = item.get("Priority", "")
+                badge = f"[{priority}] " if priority in ("HIGH", "PINNED") else ""
+                lines.append(f"  {badge}[{tag}] {note}")
+            sections.append("COACH FOCUS (open watch items)\n" + "\n".join(lines))
+
+        # --- Tier 1: Athlete Preferences ---
+        prefs = read_athlete_preferences()
+        if prefs:
+            lines = []
+            for p in prefs:
+                cat = p.get("Category", "")
+                pref = p.get("Preference", "").strip()
+                lines.append(f"  [{cat}] {pref}")
+            sections.append("ATHLETE PREFERENCES\n" + "\n".join(lines))
+
+        # --- Pending proposals (so bot knows what's awaiting confirmation) ---
+        commands = read_commands()
+        pending = [c for c in commands
+                   if c.get("Command", "").upper() == "PENDING_PROPOSAL"
+                   and c.get("Applied", "").upper() not in ("Y", "DECLINED")]
+        if pending:
+            lines = [f"  {p.get('Value', '')[:120]}" for p in pending]
+            sections.append("AWAITING ATHLETE CONFIRMATION\n" + "\n".join(lines))
+
+        # --- Athlete profile + goals ---
         profile = read_athlete_profile()
         if profile:
-            # Only first 3 lines to keep it compact
-            profile_brief = "\n".join(profile.split("\n")[:3])
-            sections.append(f"ATHLETE\n{profile_brief}")
+            sections.append(f"ATHLETE PROFILE\n{profile.strip()}")
 
-        # Long-term goals
         goals = read_long_term_goals()
         if goals:
-            goals_brief = "\n".join(goals.split("\n")[:4])
-            sections.append(f"GOALS\n{goals_brief}")
+            sections.append(f"LONG-TERM GOALS\n{goals.strip()}")
 
-        # Current strategic plan (if available)
-        plan = read_strategic_plan()
-        active_phases = [p for p in plan if not p.get("Phase", "").startswith("#")]
-        if active_phases:
-            from datetime import date
-            today = date.today()
-            for p in active_phases:
-                try:
-                    from datetime import datetime as _dt
-                    s = _dt.strptime(p.get("Start Date", ""), "%Y-%m-%d").date()
-                    e = _dt.strptime(p.get("End Date", ""), "%Y-%m-%d").date()
-                    if s <= today <= e:
-                        sections.append(
-                            f"CURRENT TRAINING PHASE\n"
-                            f"  {p.get('Phase', '?')} ({p.get('Start Date', '?')} → {p.get('End Date', '?')})\n"
-                            f"  Focus: {p.get('Focus', '?')}\n"
-                            f"  Targets: {p.get('Key Targets', '?')}"
-                        )
-                        break
-                except (ValueError, TypeError):
-                    pass
-
-        # Recent 1RM snapshot (last reading per tracked lift)
-        from memory import read_tracked_lifts
+        # --- Lift levels (last known 1RM per tracked lift) ---
         tracked_lifts = read_tracked_lifts()
-        lift_history = read_lift_history(limit=50)
+        lift_history = read_lift_history(limit=60)
         if lift_history:
             lift_lines = []
-            lifts_for_bot = [(tl["domain"], tl["match_pattern"]) for tl in tracked_lifts]
-            for _domain, lift in lifts_for_bot:
+            for tl in tracked_lifts:
+                lift = tl["match_pattern"]
                 for row in reversed(lift_history):
                     if lift.lower() in row.get("Exercise", "").lower():
                         est = row.get("Est 1RM", "")
@@ -141,8 +144,19 @@ def _build_bot_context() -> str:
             if lift_lines:
                 sections.append("CURRENT LIFT LEVELS\n" + "\n".join(lift_lines))
 
-        context = "\n\n---\n\n".join(sections)
-        return context
+        # --- Recent Telegram conversation (last 12 messages) ---
+        tg_log = read_telegram_log(limit=12)
+        if tg_log:
+            lines = []
+            for entry in tg_log:
+                direction = entry.get("Direction", "")
+                msg = entry.get("Message", "").strip()
+                d = entry.get("Date", "")
+                label = ATHLETE_NAME if direction == "IN" else "Coach"
+                lines.append(f"  [{d}] {label}: {msg}")
+            sections.append("RECENT TELEGRAM CONVERSATION\n" + "\n".join(lines))
+
+        return "\n\n---\n\n".join(sections)
 
     except Exception as e:
         return f"[Context unavailable: {e}]"
@@ -159,7 +173,12 @@ def _generate_response(user_message: str, context: str, model: str) -> str:
     bot_system = SYSTEM_PROMPT + (
         "\n\nYou are responding via Telegram — keep replies concise and conversational. "
         "This is a quick check-in, not a full coaching email. 1-4 sentences unless the question genuinely needs more. "
-        "No section headers. Natural tone."
+        "No section headers. Natural tone.\n\n"
+        "CRITICAL: Only state facts that are explicitly present in the context above. "
+        "If specific data is missing (exercise names, weights, dates, numbers), say so directly: "
+        "'I don't have that detail in front of me right now.' "
+        "Never invent training data, exercise names, weights, or results. "
+        "Never claim to have access to data that isn't shown in the context."
     )
 
     full_message = f"{context}\n\n---\n\nATHLETE MESSAGE (via Telegram): {user_message}\n\nReply as the coach."
@@ -364,6 +383,44 @@ async def handle_summary(update: Update, _context: ContextTypes.DEFAULT_TYPE) ->
     _log_message("OUT", response)
 
 
+def _classify_intent(message: str) -> str:
+    """
+    Use Haiku to classify the athlete's message into one of four routing categories:
+      WORKOUT  — today's session, substitutions, adaptation, specific exercises/sets/reps
+      HEALTH   — nutrition, recovery, sleep, blood tests, HRV, injury, supplement questions
+      PROGRAM  — structural program change requests (new block, periodization, deload week)
+      GENERAL  — everything else (progress check, motivation, life context, chat)
+
+    Returns one of: "WORKOUT" | "HEALTH" | "PROGRAM" | "GENERAL"
+    Defaults to "GENERAL" on any error.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        result = client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=10,
+            system=(
+                "You are a message router for a strength coaching app. "
+                "Classify the athlete's message into exactly one category:\n"
+                "WORKOUT — questions about today's session, exercise substitutions, sets/reps/weights, "
+                "fatigue during training, skipping/modifying a session\n"
+                "HEALTH — nutrition, recovery, sleep, blood tests, HRV, injury/pain management, supplements\n"
+                "PROGRAM — requests to restructure the training program, create a new block, "
+                "add a deload week, change the overall plan\n"
+                "GENERAL — progress updates, checking in, motivation, life context, anything else\n\n"
+                "Reply with exactly one word: WORKOUT, HEALTH, PROGRAM, or GENERAL."
+            ),
+            messages=[{"role": "user", "content": message}],
+        )
+        intent = result.content[0].text.strip().upper()
+        if intent in ("WORKOUT", "HEALTH", "PROGRAM", "GENERAL"):
+            return intent
+        return "GENERAL"
+    except Exception as e:
+        print(f"[Router] Classification failed (defaulting to GENERAL): {e}")
+        return "GENERAL"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         await update.message.reply_text("Sorry, I only talk to my athlete.")
@@ -399,16 +456,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     ctx = _build_bot_context()
 
-    # Route program design requests to the ProgramDesignerAgent
-    try:
-        from program_agent import is_program_design_query, respond as program_respond
-        if is_program_design_query(user_text):
+    # Classify intent with Haiku — single fast call instead of cascading keyword checks
+    intent = _classify_intent(user_text)
+    print(f"[Router] Intent: {intent} | Message: {user_text[:60]}")
+
+    if intent == "PROGRAM":
+        try:
+            from program_agent import respond as program_respond
             await update.message.reply_text("Thinking about your program... give me 30 seconds.")
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id, action="typing"
-            )
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
             response = program_respond(user_text, ctx)
-            # Telegram has a 4096 char limit — split if needed
             if len(response) > 4000:
                 await update.message.reply_text(response[:4000])
                 await update.message.reply_text(response[4000:])
@@ -416,31 +473,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(response)
             _log_message("OUT", response)
             return
-    except Exception as e:
-        print(f"[ProgramDesigner] Failed (falling back to standard): {e}")
+        except Exception as e:
+            print(f"[ProgramDesigner] Failed (falling back): {e}")
 
-    # Route health/recovery/nutrition questions to the HealthAgent
-    try:
-        from health_agent import is_health_query, respond as health_respond
-        if is_health_query(user_text):
+    elif intent == "HEALTH":
+        try:
+            from health_agent import respond as health_respond
             response = health_respond(user_text, ctx)
             await update.message.reply_text(response)
             _log_message("OUT", response)
             return
-    except Exception as e:
-        print(f"[HealthAgent] Failed (falling back to standard): {e}")
+        except Exception as e:
+            print(f"[HealthAgent] Failed (falling back): {e}")
 
-    # Route workout/adaptation questions to the specialized WorkoutAdvisorAgent
-    try:
-        from workout_agent import is_workout_query, respond as workout_respond
-        if is_workout_query(user_text):
+    elif intent == "WORKOUT":
+        try:
+            from workout_agent import respond as workout_respond
             response = workout_respond(user_text, ctx)
             await update.message.reply_text(response)
             _log_message("OUT", response)
             return
-    except Exception as e:
-        print(f"[WorkoutAgent] Failed (falling back to standard): {e}")
+        except Exception as e:
+            print(f"[WorkoutAgent] Failed (falling back): {e}")
 
+    # GENERAL intent or fallback from failed specialized agent
     model = _choose_model(user_text)
     response = _generate_response(user_text, ctx, model)
 
