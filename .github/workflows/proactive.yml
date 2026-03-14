@@ -1,0 +1,40 @@
+name: Proactive Check-in
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # 09:00 CET (10:00 CEST) — morning check
+    - cron: '0 14 * * *'  # 15:00 CET (16:00 CEST) — afternoon check
+  workflow_dispatch:
+
+jobs:
+  proactive-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        env:
+          GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+          GOOGLE_TOKEN_B64: ${{ secrets.GOOGLE_TOKEN_B64 }}
+        run: |
+          mkdir -p config
+          echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > config/credentials.json
+          echo "$GOOGLE_TOKEN_B64" | base64 -d > config/token.json
+
+      - name: Run proactive check-in
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MEMORY_SHEET_ID: ${{ secrets.MEMORY_SHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python src/run_coach.py --proactive

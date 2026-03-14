@@ -906,6 +906,82 @@ def build_prompt(program_data: dict, memory_data: dict,
 
 
 # ---------------------------------------------------------------------------
+# Proactive check-in prompt
+# ---------------------------------------------------------------------------
+
+def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
+    """
+    Build prompt for the proactive check-in pass (no email, no program data).
+    Claude reads compressed memory and decides whether to send a Telegram message.
+    Returns (system_prompt, user_message).
+    """
+    from datetime import timedelta
+
+    today = date.today()
+
+    system = (
+        f"You are {ATHLETE_NAME}'s strength coach. This is a brief autonomous check-in — "
+        "you're reasoning about whether to reach out via Telegram right now.\n\n"
+        "You have access to your compressed memory about the athlete's current situation.\n\n"
+        "Output rules:\n"
+        "- If you should send a message: write [TELEGRAM: your message] — 1-3 sentences, direct, not pushy\n"
+        "- If no outreach needed: write [PASS: one-sentence reason]\n"
+        "- You may also include [FOLLOWUP: ...] or [TRACKING: ...] to update your watch list\n\n"
+        "Be selective. Don't reach out if you already sent a Telegram message today. "
+        "Don't be repetitive. If the athlete said they're on vacation until a specific date, respect it. "
+        "A brief check-in is appropriate if you haven't heard in several days and there's no known break scheduled. "
+        "Consider upcoming training, pending proposals, goal milestones, or anything worth flagging."
+    )
+
+    # Coach State
+    coach_state = memory_data.get("coach_state", {})
+    state_text = _format_coach_state(coach_state) or "  (no state data)"
+
+    # Coach Focus — OPEN items only
+    focus_text = _format_coach_focus(memory_data.get("coach_focus", [])) or "  (none)"
+
+    # Recent Telegram — last 14 days
+    cutoff = str(today - timedelta(days=14))
+    tg_rows = [r for r in memory_data.get("telegram_log", [])
+               if r.get("Date", "") >= cutoff]
+    tg_rows = sorted(tg_rows, key=lambda r: (r.get("Date", ""), r.get("Time", "")))
+    tg_text = "\n".join(
+        f"  [{r.get('Date','')} {r.get('Direction','')}] {r.get('Message','')[:120]}"
+        for r in tg_rows[-20:]
+    ) or "  (no recent messages)"
+
+    # Active Commands
+    active_cmds = [
+        r for r in memory_data.get("commands", [])
+        if r.get("Applied", "").upper() not in ("Y", "DECLINED")
+        and not r.get("Command", "").startswith("#")
+    ]
+    cmd_text = "\n".join(
+        f"  {r.get('Command','')}: {r.get('Value','')}"
+        for r in active_cmds
+    ) or "  (none)"
+
+    user_message = f"""TODAY: {today.strftime('%A, %B %d, %Y')}
+
+## YOUR COMPRESSED KNOWLEDGE (Coach State)
+{state_text}
+
+## OPEN WATCH ITEMS (Coach Focus)
+{focus_text}
+
+## RECENT TELEGRAM CONVERSATION (last 14 days)
+{tg_text}
+
+## ACTIVE COMMANDS
+{cmd_text}
+
+---
+Should you reach out right now? Output [TELEGRAM: message] or [PASS: reason]."""
+
+    return system, user_message
+
+
+# ---------------------------------------------------------------------------
 # Dev entry point
 # ---------------------------------------------------------------------------
 

@@ -58,7 +58,8 @@ def get_credentials() -> Credentials:
 
 
 def get_client() -> gspread.Client:
-    return gspread.authorize(get_credentials())
+    from gspread.http_client import BackOffHTTPClient
+    return gspread.authorize(get_credentials(), http_client=BackOffHTTPClient)
 
 
 # ---------------------------------------------------------------------------

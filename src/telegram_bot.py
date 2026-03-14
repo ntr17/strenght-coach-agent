@@ -182,6 +182,32 @@ _CONFIRM_WORDS = {"yes", "yep", "yeah", "confirm", "confirmed", "do it", "go ahe
 _DECLINE_WORDS = {"no", "nope", "cancel", "reject", "rejected", "don't", "dont",
                   "stop", "forget it", "never mind", "nevermind"}
 
+# Phrases that end an active SKIP_UNTIL (resume emails)
+_RESUME_PHRASES = ["resume emails", "end skip", "cancel skip", "unpause", "resume coaching",
+                   "reanudar emails", "fin de pausa"]
+
+
+def _end_skip_until() -> bool:
+    """
+    Mark any active SKIP_UNTIL command as Applied=Y, effectively ending the email pause.
+    Returns True if a SKIP_UNTIL was found and cleared, False otherwise.
+    """
+    try:
+        from memory import read_commands, mark_command_applied
+        commands = read_commands()
+        cleared = False
+        for cmd in commands:
+            if (cmd.get("Command", "").upper().strip() == "SKIP_UNTIL"
+                    and cmd.get("Applied", "").upper().strip() not in ("Y", "DECLINED")):
+                row_index = cmd.get("_row_index")
+                if row_index:
+                    mark_command_applied(row_index)
+                    cleared = True
+        return cleared
+    except Exception as e:
+        print(f"[Telegram] End-skip failed (non-fatal): {e}")
+        return False
+
 
 def _get_pending_proposals() -> list[dict]:
     """Return unapplied PENDING_PROPOSAL rows from Commands tab."""
@@ -331,6 +357,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     _log_message("IN", user_text)
 
+    # Check for SKIP_UNTIL control phrases
+    lower = user_text.lower()
+    if any(phrase in lower for phrase in _RESUME_PHRASES):
+        cleared = _end_skip_until()
+        if cleared:
+            reply = "Done — emails resume tonight. I'll be in touch as usual."
+        else:
+            reply = "No active email pause found. Emails are already running normally."
+        await update.message.reply_text(reply)
+        _log_message("OUT", reply)
+        return
+
     # Check for yes/no confirmation of a pending proposal before normal routing
     if await _handle_confirmation(update, user_text):
         return
@@ -341,8 +379,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         action="typing",
     )
 
-    model = _choose_model(user_text)
     ctx = _build_bot_context()
+
+    # Route workout/adaptation questions to the specialized WorkoutAdvisorAgent
+    try:
+        from workout_agent import is_workout_query, respond as workout_respond
+        if is_workout_query(user_text):
+            response = workout_respond(user_text, ctx)
+            await update.message.reply_text(response)
+            _log_message("OUT", response)
+            return
+    except Exception as e:
+        print(f"[WorkoutAgent] Failed (falling back to standard): {e}")
+
+    model = _choose_model(user_text)
     response = _generate_response(user_text, ctx, model)
 
     await update.message.reply_text(response)

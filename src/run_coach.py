@@ -9,6 +9,7 @@ Usage:
   python src/run_coach.py --no-sync    # Skip writing new data to Coach Memory (read-only)
   python src/run_coach.py --weekly     # Force a weekly summary email with charts
   python src/run_coach.py --think      # Run strategic planning pass only (no email)
+  python src/run_coach.py --proactive  # Lightweight check-in: read memory, optionally send Telegram
 """
 
 import argparse
@@ -40,6 +41,8 @@ def parse_args():
                         help="Force a weekly summary email with charts (normally auto on Sundays)")
     parser.add_argument("--think", action="store_true",
                         help="Run strategic planning pass only — updates Coach Memory, no email sent")
+    parser.add_argument("--proactive", action="store_true",
+                        help="Lightweight check-in: read memory, reason, optionally send Telegram. No email.")
     return parser.parse_args()
 
 
@@ -424,6 +427,61 @@ def run_think(week_num: int = None, dry_run: bool = False):
     print("Planning pass complete.")
 
 
+def run_proactive(dry_run: bool = False):
+    """
+    Lightweight proactive check-in. No email, no program sheet, no Tier 0 archives.
+    Reads compressed memory (5 tabs), reasons with Claude Haiku, optionally sends Telegram.
+    Called: (a) directly via --proactive flag 2x/day, (b) by run() when SKIP_UNTIL is active.
+    SKIP_UNTIL only blocks the email pipeline — this pass always runs.
+    """
+    from memory import (read_coach_state, read_coach_focus, read_athlete_preferences,
+                        read_telegram_log, read_commands, log_coach_run)
+    from prompt import build_proactive_prompt
+
+    today = date.today()
+    print(f"[{today}] Running proactive check-in pass...")
+
+    memory_data = {
+        "coach_state":         read_coach_state(),
+        "coach_focus":         read_coach_focus(),
+        "athlete_preferences": read_athlete_preferences(),
+        "telegram_log":        read_telegram_log(),
+        "commands":            read_commands(),
+    }
+
+    system_prompt, user_message = build_proactive_prompt(memory_data)
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{"role": "user", "content": user_message}],
+        system=system_prompt,
+    )
+    output = response.content[0].text.strip()
+    print(f"  Coach reasoning: {output[:150]}")
+
+    _, tg_alert = extract_telegram_alert(output)
+    _, focus_updates = parse_coach_focus_markers(output)
+
+    if tg_alert:
+        if dry_run:
+            print(f"  [DRY RUN] Would send Telegram: {tg_alert}")
+        else:
+            from telegram_utils import send_telegram_message
+            sent = send_telegram_message(tg_alert)
+            if sent:
+                print(f"  Proactive Telegram sent: {tg_alert[:80]}")
+                log_coach_run(today,
+                              key_observations="Proactive check-in pass",
+                              email_summary=f"[PROACTIVE] {tg_alert}")
+    else:
+        print("  Proactive pass: no outreach needed.")
+
+    if focus_updates and not dry_run:
+        write_coach_focus_updates(focus_updates)
+
+
 def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         force_weekly: bool = False):
     from sheets import read_program_data
@@ -442,8 +500,9 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
 
     # --- Check for skip command ---
     skip_until = check_skip_today()
-    if skip_until and not dry_run:
-        print(f"  SKIP_UNTIL command active — no email until {skip_until}. Exiting.")
+    if skip_until:
+        print(f"  SKIP_UNTIL active (emails paused until {skip_until}) — running proactive check-in instead.")
+        run_proactive(dry_run=dry_run)
         return None
 
     # 1. Expire stale Coach Focus items (Priority-aware: PINNED=never, HIGH=90d, NORMAL=30d)
@@ -672,6 +731,8 @@ if __name__ == "__main__":
     try:
         if args.think:
             run_think(week_num=week_num, dry_run=args.dry_run)
+        elif args.proactive:
+            run_proactive(dry_run=args.dry_run)
         else:
             run(
                 week_num=week_num,
