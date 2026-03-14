@@ -961,6 +961,28 @@ def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
         for r in active_cmds
     ) or "  (none)"
 
+    # Recent health log (last 7 days — lightweight for proactive pass)
+    health_log = memory_data.get("health_log", [])
+    recent_health = health_log[-7:] if health_log else []
+    health_lines = []
+    for e in recent_health:
+        d = e.get("Date", "?")
+        bw = e.get("Bodyweight (kg)", "")
+        sleep = e.get("Sleep (hrs)", "")
+        food = e.get("Food Quality (1-10)", "")
+        notes = e.get("Notes", "")
+        parts = [f"[{d}]"]
+        if bw:
+            parts.append(f"BW:{bw}kg")
+        if sleep:
+            parts.append(f"sleep:{sleep}h")
+        if food:
+            parts.append(f"food:{food}/10")
+        if notes:
+            parts.append(f"note:{notes[:50]}")
+        health_lines.append(" ".join(parts))
+    health_text = "\n".join(f"  {l}" for l in health_lines) or "  (no recent health data)"
+
     user_message = f"""TODAY: {today.strftime('%A, %B %d, %Y')}
 
 ## YOUR COMPRESSED KNOWLEDGE (Coach State)
@@ -968,6 +990,9 @@ def build_proactive_prompt(memory_data: dict) -> tuple[str, str]:
 
 ## OPEN WATCH ITEMS (Coach Focus)
 {focus_text}
+
+## RECENT HEALTH LOG (last 7 days)
+{health_text}
 
 ## RECENT TELEGRAM CONVERSATION (last 14 days)
 {tg_text}

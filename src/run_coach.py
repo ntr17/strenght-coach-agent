@@ -430,23 +430,28 @@ def run_think(week_num: int = None, dry_run: bool = False):
 def run_proactive(dry_run: bool = False):
     """
     Lightweight proactive check-in. No email, no program sheet, no Tier 0 archives.
-    Reads compressed memory (5 tabs), reasons with Claude Haiku, optionally sends Telegram.
+    Reads compressed memory (6 tabs incl. health_log), reasons with Claude Haiku,
+    optionally sends Telegram. Also runs HealthAgent health-specific proactive check.
     Called: (a) directly via --proactive flag 2x/day, (b) by run() when SKIP_UNTIL is active.
     SKIP_UNTIL only blocks the email pipeline — this pass always runs.
     """
     from memory import (read_coach_state, read_coach_focus, read_athlete_preferences,
-                        read_telegram_log, read_commands, log_coach_run)
+                        read_telegram_log, read_commands, read_health_log,
+                        read_athlete_profile, log_coach_run)
     from prompt import build_proactive_prompt
 
     today = date.today()
     print(f"[{today}] Running proactive check-in pass...")
 
+    coach_state = read_coach_state()
+    health_log = read_health_log(limit=14)
     memory_data = {
-        "coach_state":         read_coach_state(),
+        "coach_state":         coach_state,
         "coach_focus":         read_coach_focus(),
         "athlete_preferences": read_athlete_preferences(),
         "telegram_log":        read_telegram_log(),
         "commands":            read_commands(),
+        "health_log":          health_log,
     }
 
     system_prompt, user_message = build_proactive_prompt(memory_data)
@@ -472,14 +477,44 @@ def run_proactive(dry_run: bool = False):
             sent = send_telegram_message(tg_alert)
             if sent:
                 print(f"  Proactive Telegram sent: {tg_alert[:80]}")
-                log_coach_run(today,
-                              key_observations="Proactive check-in pass",
-                              email_summary=f"[PROACTIVE] {tg_alert}")
+                log_coach_run(
+                    observations="Proactive check-in pass",
+                    email_summary=f"[PROACTIVE] {tg_alert}",
+                )
     else:
         print("  Proactive pass: no outreach needed.")
 
     if focus_updates and not dry_run:
         write_coach_focus_updates(focus_updates)
+
+    # --- HealthAgent proactive check (Haiku, runs after main proactive pass) ---
+    try:
+        from health_agent import run_health_proactive
+        athlete_profile = ""
+        try:
+            from memory import read_athlete_profile
+            athlete_profile = read_athlete_profile()
+        except Exception:
+            pass
+        health_tg = run_health_proactive(health_log, coach_state, athlete_profile)
+        if health_tg:
+            if dry_run:
+                print(f"  [DRY RUN] HealthAgent would send: {health_tg}")
+            elif not tg_alert:  # only send if main proactive pass didn't already send
+                from telegram_utils import send_telegram_message
+                sent = send_telegram_message(health_tg)
+                if sent:
+                    print(f"  HealthAgent proactive sent: {health_tg[:80]}")
+                    log_coach_run(
+                        observations="Health proactive check-in",
+                        email_summary=f"[HEALTH_PROACTIVE] {health_tg}",
+                    )
+            else:
+                print(f"  HealthAgent wanted to send but main pass already sent — skipping.")
+        else:
+            print("  HealthAgent proactive: no health outreach needed.")
+    except Exception as e:
+        print(f"  HealthAgent proactive failed (non-fatal): {e}")
 
 
 def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,

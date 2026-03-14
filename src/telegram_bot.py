@@ -265,9 +265,27 @@ async def _handle_confirmation(update: Update, user_text: str) -> bool:
 
         if is_yes:
             _resolve_proposal(row_index, "Y", proposal_text)
+
+            # Attempt write-back immediately
+            wb_msg = ""
+            try:
+                from writeback import apply_writeback
+                from config import compute_current_week, resolve_program_start_date
+                current_week = compute_current_week(resolve_program_start_date())
+                success, wb_result = apply_writeback(
+                    proposal_text, current_week=current_week
+                )
+                if success:
+                    wb_msg = f" Done — {wb_result}."
+                else:
+                    wb_msg = f" Note: couldn't auto-update the sheet ({wb_result})."
+                print(f"  [WriteBack] {wb_result}")
+            except Exception as e:
+                wb_msg = " (Sheet update failed — please update manually.)"
+                print(f"  [WriteBack] Error: {e}")
+
             reply = (
-                f"Got it — confirmed. I've logged this and will apply it to the program: "
-                f"\"{proposal_text[:120]}\". I'll report in the next email."
+                f"Confirmed.{wb_msg} I'll reference this in the next email."
             )
         else:
             _resolve_proposal(row_index, "DECLINED", proposal_text)
@@ -380,6 +398,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     ctx = _build_bot_context()
+
+    # Route health/recovery/nutrition questions to the HealthAgent
+    try:
+        from health_agent import is_health_query, respond as health_respond
+        if is_health_query(user_text):
+            response = health_respond(user_text, ctx)
+            await update.message.reply_text(response)
+            _log_message("OUT", response)
+            return
+    except Exception as e:
+        print(f"[HealthAgent] Failed (falling back to standard): {e}")
 
     # Route workout/adaptation questions to the specialized WorkoutAdvisorAgent
     try:
