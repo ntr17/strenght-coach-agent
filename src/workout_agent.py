@@ -60,18 +60,16 @@ def _format_program_for_context(program_data: dict) -> str:
         lines.append(f"CURRENT WEEK: Week {week_num}")
 
     current_week = program_data.get("current_week", {})
-    days = current_week.get("days", {})
+    days = current_week.get("days", [])
 
     if days:
         lines.append("\nTHIS WEEK'S PROGRAM:")
-        for day_label, day_data in sorted(days.items()):
-            day_name = day_data.get("day_name", day_label)
+        for day_data in days:
+            day_name = day_data.get("label", day_data.get("day_name", "Day"))
             exercises = day_data.get("exercises", [])
-            done = day_data.get("done", False)
-            status = " ✓" if done else ""
-            lines.append(f"\n  {day_name}{status}:")
+            lines.append(f"\n  {day_name}:")
             for ex in exercises:
-                name = ex.get("exercise", "")
+                name = ex.get("name", ex.get("exercise", ""))
                 weight = ex.get("weight", "")
                 sets_reps = ex.get("sets_reps", "")
                 actual = ex.get("actual", "")
