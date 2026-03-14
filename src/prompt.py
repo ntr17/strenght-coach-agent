@@ -680,6 +680,58 @@ def _format_coach_focus(coach_focus: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_periodization_context(week_num: int, total_weeks: int,
+                                   progression: dict) -> str:
+    """
+    Build a phase-aware context block telling the coach where we are in the program arc
+    and what that means for today's coaching decisions.
+    """
+    if not total_weeks or total_weeks < 2:
+        return ""
+
+    pct = round(week_num / total_weeks * 100)
+    weeks_left = total_weeks - week_num
+
+    # Determine macro phase from position in program
+    if pct <= 30:
+        macro = "early accumulation — foundation building, volume priority, technique focus"
+        implication = "Don't chase intensity yet. Volume and consistency matter more than PRs."
+    elif pct <= 55:
+        macro = "mid-program intensification — strength building, load increasing"
+        implication = "Progressive overload is the priority. Watch for fatigue accumulation."
+    elif pct <= 75:
+        macro = "late intensification — approaching peak loads"
+        implication = "Recovery quality is now as important as training quality. Flag any fatigue signals."
+    elif pct <= 90:
+        macro = "peaking — near-maximal loads, volume reducing"
+        implication = "Protect the athlete. Don't add stress. Peak is close — stay the course."
+    else:
+        macro = "final weeks — program completion approaching"
+        implication = "Start thinking about what comes next. Transition planning belongs in this email."
+
+    # Block info from progression tab
+    block_line = ""
+    current_entry = progression.get(week_num, {})
+    next_entry = progression.get(week_num + 1, {})
+    if current_entry:
+        block = current_entry.get("block", "")
+        wtype = current_entry.get("type", "")
+        if block and wtype:
+            block_line = f"Current block: Block {block} — {wtype}"
+        # Detect if next week is a deload/transition
+        if next_entry.get("type", "").lower() in ("deload", "transition", "recovery"):
+            block_line += f" → next week: {next_entry.get('type', '')} (upcoming recovery)"
+
+    lines = [
+        f"Program position: Week {week_num}/{total_weeks} ({pct}% complete, {weeks_left} weeks left)",
+        f"Phase: {macro}",
+        f"Coaching implication: {implication}",
+    ]
+    if block_line:
+        lines.append(block_line)
+    return "\n".join(f"  {l}" for l in lines)
+
+
 def _format_coach_state(coach_state: dict) -> str:
     """
     Format the Coach State tab as a compact briefing.
@@ -730,7 +782,8 @@ def build_prompt(program_data: dict, memory_data: dict,
                  replies: list[dict] = None,
                  is_weekly_summary: bool = False,
                  plateau_deep_dives: dict = None,
-                 projections_text: str = "") -> tuple[str, str]:
+                 projections_text: str = "",
+                 program_complete: bool = False) -> tuple[str, str]:
     """
     Build the system prompt and user message for Claude.
 
@@ -783,6 +836,11 @@ def build_prompt(program_data: dict, memory_data: dict,
     except Exception:
         pass
 
+    # Periodization context: where are we in the program arc?
+    periodization_context = _build_periodization_context(
+        week_num, total_weeks, progression
+    )
+
     sections = []
 
     # --- Date & week context ---
@@ -801,6 +859,30 @@ def build_prompt(program_data: dict, memory_data: dict,
         f"Coaching duration: ~{coaching_duration}\n"
         f"Email type: {email_type}"
     )
+
+    # --- Program completion ceremony ---
+    if program_complete:
+        sections.append(
+            f"PROGRAM COMPLETE — THIS IS THE FINAL EMAIL OF THE PROGRAM\n"
+            f"  {prog_name} is done. Week {week_num}/{total_weeks or week_num} completed.\n"
+            "  This email is a milestone moment — write a proper program wrap-up:\n"
+            "  • Acknowledge the achievement directly (completing a full program is real work)\n"
+            "  • Summarize the key progress: 1RM gains per main lift, overall consistency\n"
+            "  • What did he do well this program? What did he struggle with? Be honest, not sycophantic.\n"
+            "  • Name the 2-3 biggest lessons or patterns you observed over the full program\n"
+            "  • Signal what comes next — ask about goals and preferences for the next block\n"
+            "  Required markers:\n"
+            f"    [LANDMARK: Program complete — {prog_name}, {week_num} weeks, {date.today()}]\n"
+            "    [TELEGRAM: short celebration message + 'What kind of training do you want next?']\n"
+            "    [FOLLOWUP: What do you want to focus on in the next program?]"
+        )
+
+    # --- Periodization context (phase-aware coaching implications) ---
+    if periodization_context and not program_complete:
+        sections.append(
+            "PERIODIZATION CONTEXT (where we are in the program arc — let this inform your tone and priorities)\n"
+            + periodization_context
+        )
 
     # --- Coach State (your compressed knowledge from last run — read this first) ---
     coach_state = memory_data.get("coach_state", {})
@@ -998,9 +1080,14 @@ def build_proactive_prompt(memory_data: dict, program_data: dict = None) -> tupl
         "You are the same coach who writes the daily email. Telegram is your primary real-time channel.\n\n"
         "TRIGGER CONDITIONS (check these in order):\n"
         "1. TRAINING DAY PREP (morning): If today is a scheduled training day and no session logged yet "
-        "→ send a brief prep message with today's prescribed exercises. Keep it punchy — 1-2 sentences.\n"
+        "→ send a readiness-aware prep message. Check the RECENT HEALTH LOG:\n"
+        "   • Sleep < 6h or energy ≤ 5/10 → flag it: 'Sleep was rough last night — consider dropping "
+        "intensity 10-15% on the heavy sets today. Still worth going.'\n"
+        "   • Sleep ≥ 7h and energy ≥ 7/10 → green light: brief, energising message with today's key lift.\n"
+        "   • No health data → just confirm today's session and key lift.\n"
         "2. SESSION FOLLOW-UP (afternoon): If today was a training day and session still not logged "
-        "→ ask how it went, what they actually did.\n"
+        "→ ask how it went, what they actually did. If health data showed fatigue → ask specifically if "
+        "they adjusted the load.\n"
         "3. OPEN QUESTION (any time): If there's an unanswered OPEN_QUESTION more than 6 hours old "
         "→ gently follow up. Don't be annoying — max once per question.\n"
         "4. PLAN FLEXIBILITY (any time): If there's a PENDING_CATCHUP command (athlete planned to reschedule) "

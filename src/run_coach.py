@@ -63,6 +63,10 @@ def generate_analysis(system_prompt: str, user_message: str) -> str:
         "- LANDMARK (significant for weeks — PRs, milestones, injuries, major decisions): [list or 'none']\n"
         "- SIGNAL (pattern worth addressing — recurring behavior, multi-week trend, athlete question): [list or 'none']\n"
         "- NOISE (one-off disruption — travel miss, minor scheduling — acknowledge briefly, don't dwell): [list or 'none']\n\n"
+        "PERIODIZATION CHECK:\n"
+        "- What phase are we in? What does that mean for load, volume, and intensity today?\n"
+        "- Is the athlete's recent performance consistent with where they should be at this stage?\n"
+        "- Any phase-transition signals? (e.g. approaching deload, peak, program end)\n\n"
         "OPEN FOLLOW-UPS CHECK: [From your watch list — what needs checking today? What might be resolved? What is stale?]\n\n"
         "WHAT MATTERS TODAY: [1-2 things max — be ruthlessly selective. The athlete's attention is limited.]\n\n"
         "COACH'S OWN AGENDA: [What will you push today independent of athlete input? Think: ignored trends, "
@@ -114,6 +118,67 @@ def _compute_cost(usage_list: list) -> float:
             total += (getattr(u, "input_tokens", 0) / 1_000_000 * 3.0)
             total += (getattr(u, "output_tokens", 0) / 1_000_000 * 15.0)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Email reply preprocessing — extract structured facts via Haiku (same as Telegram processor)
+# ---------------------------------------------------------------------------
+
+def preprocess_email_replies(replies: list[dict], dry_run: bool = False) -> int:
+    """
+    Run a Haiku pass on each email reply to extract structured facts into memory.
+    Reuses the same categories as the Telegram processor.
+    Returns number of facts dispatched.
+    """
+    if not replies:
+        return 0
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    dispatched = 0
+
+    for reply in replies:
+        body = reply.get("body", "").strip()
+        if not body:
+            continue
+
+        prompt = (
+            "Extract structured facts from this athlete's email reply to their coach.\n"
+            "Use the same format as Telegram processing:\n"
+            "CATEGORY | DATE | FACT\n\n"
+            "Categories: SCHEDULE_CHANGE | PENDING_CATCHUP | LIFE_EVENT | PREFERENCE | "
+            "LIFT_UPDATE | MOOD_PERFORMANCE | HEALTH_DATA | PROGRAM_REQUEST | QUESTION | NOISE\n\n"
+            "Rules:\n"
+            "- DATE: use today's date if not specified\n"
+            "- One line per fact\n"
+            "- NOISE: skip unless useful\n"
+            "- Only output lines in the format above, nothing else\n\n"
+            f"Email reply:\n{body[:600]}"
+        )
+
+        try:
+            result = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            output = result.content[0].text.strip()
+            if dry_run:
+                print(f"  [DRY RUN] Email reply facts:\n{output}")
+                continue
+
+            # Dispatch facts using the processor's dispatcher
+            try:
+                from processor import _dispatch_events, _parse_processor_output
+                events = _parse_processor_output(output)
+                if events:
+                    dispatched += _dispatch_events(events, dry_run=False)
+                    print(f"  [EmailReply] {len(events)} fact(s) extracted and dispatched")
+            except Exception as e:
+                print(f"  [EmailReply] Dispatch failed (non-fatal): {e}")
+        except Exception as e:
+            print(f"  [EmailReply] Haiku pass failed (non-fatal): {e}")
+
+    return dispatched
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +484,79 @@ def log_pending_proposal(proposal_text: str, existing_commands: list[dict]) -> N
 # Main run
 # ---------------------------------------------------------------------------
 
+def detect_difficulty_patterns(program_data: dict,
+                                telegram_log: list[dict] = None) -> list[dict]:
+    """
+    Scan session notes across recent weeks for per-lift difficulty signals.
+    3+ consecutive easy signals → propose weight bump.
+    3+ consecutive hard/failed signals → flag for deload/check.
+    Returns list of {lift, signal, count, note} dicts.
+    """
+    EASY_KEYWORDS = {"easy", "light", "too easy", "felt light", "felt easy", "could do more"}
+    HARD_KEYWORDS = {"failed", "fail", "missed", "couldn't", "too heavy", "struggled", "couldn't finish"}
+
+    lift_signals: dict[str, list[str]] = {}  # lift_name → ["easy"|"hard", ...]
+
+    current_week = program_data.get("current_week", {})
+    recent_weeks = program_data.get("recent_weeks", [])
+    all_weeks = recent_weeks + ([current_week] if current_week else [])
+
+    for week in all_weeks:
+        for day in week.get("days", []):
+            for ex in day.get("exercises", []):
+                name = (ex.get("name") or "").strip()
+                if not name:
+                    continue
+                note = (ex.get("session_note") or ex.get("notes") or "").lower()
+                done = ex.get("done")
+
+                signal = None
+                if done is False:
+                    signal = "hard"
+                elif note:
+                    if any(kw in note for kw in EASY_KEYWORDS):
+                        signal = "easy"
+                    elif any(kw in note for kw in HARD_KEYWORDS):
+                        signal = "hard"
+
+                if signal:
+                    lift_signals.setdefault(name, []).append(signal)
+
+    # Supplement with Telegram MOOD_PERFORMANCE notes
+    if telegram_log:
+        for entry in telegram_log:
+            msg = (entry.get("Message") or "").lower()
+            for lift_name in list(lift_signals.keys()):
+                if lift_name.lower() in msg:
+                    if any(kw in msg for kw in EASY_KEYWORDS):
+                        lift_signals[lift_name].append("easy")
+                    elif any(kw in msg for kw in HARD_KEYWORDS):
+                        lift_signals[lift_name].append("hard")
+
+    flags = []
+    for lift_name, signals in lift_signals.items():
+        if len(signals) < 3:
+            continue
+        recent = signals[-6:]
+        easy_count = recent.count("easy")
+        hard_count = recent.count("hard")
+        if easy_count >= 3:
+            flags.append({
+                "lift": lift_name,
+                "signal": "easy",
+                "count": easy_count,
+                "note": f"{lift_name}: {easy_count}/{len(recent)} recent sessions felt easy/light — consider weight bump",
+            })
+        elif hard_count >= 3:
+            flags.append({
+                "lift": lift_name,
+                "signal": "hard",
+                "count": hard_count,
+                "note": f"{lift_name}: {hard_count}/{len(recent)} sessions failed/too heavy — check deload need",
+            })
+    return flags
+
+
 def run_think(week_num: int = None, dry_run: bool = False):
     """Run the strategic planning pass only. No email sent."""
     from sheets import read_program_data
@@ -491,14 +629,30 @@ def run_proactive(dry_run: bool = False):
         if dry_run:
             print(f"  [DRY RUN] Would send Telegram: {tg_alert}")
         else:
-            from telegram_utils import send_telegram_message
-            sent = send_telegram_message(tg_alert)
-            if sent:
-                print(f"  Proactive Telegram sent: {tg_alert[:80]}")
-                log_coach_run(
-                    observations="Proactive check-in pass",
-                    email_summary=f"[PROACTIVE] {tg_alert}",
-                )
+            # Dedup gate: don't send if we already sent a proactive message in the last 4 hours
+            from datetime import datetime as _dt
+            now_str = _dt.utcnow().strftime("%Y-%m-%dT%H:%M")
+            last_sent = coach_state.get("LAST_PROACTIVE", {}).get("summary", "")
+            hours_since = 999
+            if last_sent:
+                try:
+                    last_dt = _dt.strptime(last_sent[:16], "%Y-%m-%dT%H:%M")
+                    hours_since = (_dt.utcnow() - last_dt).total_seconds() / 3600
+                except Exception:
+                    pass
+            if hours_since < 4:
+                print(f"  Proactive dedup: last sent {hours_since:.1f}h ago — skipping.")
+            else:
+                from telegram_utils import send_telegram_message
+                sent = send_telegram_message(tg_alert)
+                if sent:
+                    print(f"  Proactive Telegram sent: {tg_alert[:80]}")
+                    from memory import upsert_coach_state
+                    upsert_coach_state("LAST_PROACTIVE", now_str, "HIGH")
+                    log_coach_run(
+                        observations="Proactive check-in pass",
+                        email_summary=f"[PROACTIVE] {tg_alert}",
+                    )
     else:
         print("  Proactive pass: no outreach needed.")
 
@@ -582,6 +736,19 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
     print("  Reading coach memory...")
     memory_data = read_all()
 
+    # --- Check for program completion ---
+    program_complete = False
+    try:
+        from memory import get_active_program_info
+        prog_info = get_active_program_info()
+        if prog_info:
+            total_weeks = int(prog_info.get("total_weeks") or 0)
+            if total_weeks and week_num >= total_weeks:
+                program_complete = True
+                print(f"  *** PROGRAM COMPLETE: Week {week_num}/{total_weeks} ***")
+    except Exception as e:
+        print(f"  Program completion check failed (non-fatal): {e}")
+
     # --- Determine email type (after memory load so we can read Athlete Preferences) ---
     # Recap day is read from Athlete Preferences (SCHEDULE | weekly_recap_day: <dayname>)
     # Falls back to Sunday (weekday 6). Athlete can change this via Telegram.
@@ -613,6 +780,11 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
     replies = read_recent_replies(after_date=last_run_date, max_results=5)
     if replies:
         print(f"    → {len(replies)} reply(ies) found")
+        # Preprocess replies: extract structured facts via Haiku (same as Telegram processor)
+        if not no_sync:
+            n = preprocess_email_replies(replies, dry_run=dry_run)
+            if n:
+                print(f"    → {n} fact(s) extracted from email replies")
 
     # 7. Sync new data to memory (unless --no-sync)
     if not no_sync:
@@ -643,6 +815,7 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
         replies=replies,
         is_weekly_summary=is_weekly_summary,
         projections_text=projections.get("formatted", ""),
+        program_complete=program_complete,
     )
 
     # 9. Plateau detection + per-lift deep dives
@@ -659,7 +832,38 @@ def run(week_num: int = None, dry_run: bool = False, no_sync: bool = False,
             is_weekly_summary=is_weekly_summary,
             plateau_deep_dives=plateau_dives,
             projections_text=projections.get("formatted", ""),
+            program_complete=program_complete,
         )
+
+    # 9b. Outcome learning loop: detect easy/hard difficulty patterns per lift
+    print("  Running outcome learning loop...")
+    try:
+        difficulty_flags = detect_difficulty_patterns(
+            program_data=program_data,
+            telegram_log=memory_data.get("telegram_log", []),
+        )
+        if difficulty_flags:
+            print(f"    → {len(difficulty_flags)} difficulty pattern(s) detected")
+            if not dry_run and not no_sync:
+                existing_focus = memory_data.get("coach_focus", [])
+                open_items_text = [f.get("Item", "").lower() for f in existing_focus
+                                   if f.get("Status", "OPEN") == "OPEN"]
+                today_str = str(today)
+                for flag in difficulty_flags:
+                    # Skip if already flagged for this lift
+                    already = any(flag["lift"].lower() in t for t in open_items_text)
+                    if not already:
+                        from memory import append_coach_focus
+                        append_coach_focus("TRACKING", flag["note"],
+                                           priority="HIGH", last_mentioned=today_str)
+                        print(f"    [Outcome loop] {flag['note'][:80]}")
+            elif dry_run:
+                for flag in difficulty_flags:
+                    print(f"    [DRY RUN] Outcome loop: {flag['note']}")
+        else:
+            print("    → No difficulty patterns found")
+    except Exception as e:
+        print(f"  Outcome learning loop failed (non-fatal): {e}")
 
     # 10. Analysis pass (reasoning before writing)
     print("  Running analysis pass...")

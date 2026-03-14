@@ -1056,6 +1056,32 @@ async def handle_data(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
     _log_message("OUT", "[data summary]")
 
 
+async def handle_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show this week's full schedule with done/not done status."""
+    if not _is_authorized(update):
+        return
+
+    args = context.args
+    try:
+        week_num = int(args[0]) if args else None
+    except (ValueError, IndexError):
+        week_num = None
+
+    result = _tool_get_program_week(week_num=week_num)
+
+    # Annotate with completion summary
+    lines = result.split("\n")
+    done = sum(1 for l in lines if "✓" in l and l.strip().startswith(("    ")))
+    total = sum(1 for l in lines if l.strip().startswith(("    ")) and ":" in l)
+    if total:
+        summary = f"\n{done}/{total} exercises completed"
+        result += summary
+
+    await update.message.reply_text(result[:4000])
+    _log_message("IN", "/week")
+    _log_message("OUT", f"[week schedule, {done}/{total} done]")
+
+
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a progress chart. Usage: /chart [1rm|bodyweight|volume]"""
     if not _is_authorized(update):
@@ -1424,6 +1450,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("summary", handle_summary))
+    app.add_handler(CommandHandler("week", handle_week))
     app.add_handler(CommandHandler("chart", handle_chart))
     app.add_handler(CommandHandler("data", handle_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
