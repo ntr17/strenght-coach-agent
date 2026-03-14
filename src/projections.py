@@ -57,11 +57,31 @@ def _weeks_since(reference_date: date, target_date: date) -> float:
 # 1RM Projection
 # ---------------------------------------------------------------------------
 
+def _exercise_matches(exercise_name: str, row_exercise: str) -> bool:
+    """
+    Match exercise_name against a Lift History row exercise name.
+
+    Uses word-boundary matching at the start of the exercise name so that
+    "Squat" matches "Squat" and "Squat (Volume)" but NOT "Front Squat".
+    The match pattern must appear at the beginning of the exercise name
+    (case-insensitive), followed by end-of-string or a non-word character.
+
+    Examples:
+        "Squat"      matches "Squat", "Squat (Volume)", "Squat Heavy"
+        "Squat"      does NOT match "Front Squat", "Goblet Squat"
+        "Bench Press" matches "Bench Press", "Bench Press (Close Grip)"
+        "Bench Press" does NOT match "Dumbbell Bench Press"
+    """
+    pattern = r"(?i)^" + re.escape(exercise_name) + r"(\s|$|\()"
+    return bool(re.match(pattern, row_exercise.strip()))
+
+
 def project_1rm(
     exercise_name: str,
     lift_history: list[dict],
     target_1rm: float = None,
     weeks_remaining: int = None,
+    window_days: int = 42,
 ) -> Optional[dict]:
     """
     Project estimated 1RM forward for a given exercise.
@@ -71,15 +91,23 @@ def project_1rm(
         lift_history: rows from Lift History tab (must have Est 1RM + Date fields)
         target_1rm: goal 1RM in kg (optional — for on-track assessment)
         weeks_remaining: weeks left in program (optional)
+        window_days: only include readings from the last N days (default 42 = 6 weeks)
+
+    Matching: word-boundary at start — "Squat" matches "Squat (Volume)" but NOT "Front Squat".
+
+    Current 1RM: MAX in window — intentionally lighter sessions don't pull the estimate down.
+    Trend (slope): linear regression over deduplicated weekly-max readings in window.
 
     Returns dict with:
         exercise, current_1rm, rate_per_week, projected_end_1rm,
         on_track (bool|None), weeks_to_target (float|None), data_points
-    Returns None if insufficient data (<2 readings).
+    Returns None if insufficient data (<2 unique-date readings).
     """
-    readings = []
+    cutoff = date.today() - timedelta(days=window_days)
+
+    raw = []
     for row in lift_history:
-        if exercise_name.lower() not in row.get("Exercise", "").lower():
+        if not _exercise_matches(exercise_name, row.get("Exercise", "")):
             continue
         est = row.get("Est 1RM", "")
         date_str = row.get("Date", "")
@@ -88,15 +116,23 @@ def project_1rm(
         try:
             val = float(str(est).replace(",", "."))
             d = _parse_date(date_str)
-            if d and val > 0:
-                readings.append((d, val))
+            if d and val > 0 and d >= cutoff:
+                raw.append((d, val))
         except (ValueError, TypeError):
             pass
 
-    if len(readings) < 2:
+    if not raw:
         return None
 
-    readings.sort(key=lambda r: r[0])
+    # Deduplicate: keep max 1RM per date (multiple sessions same day → take best)
+    by_date: dict[date, float] = {}
+    for d, val in raw:
+        by_date[d] = max(by_date.get(d, 0.0), val)
+
+    readings = sorted(by_date.items())  # [(date, max_val), ...]
+
+    if len(readings) < 2:
+        return None
 
     # Use last 8 readings for trend (recent trajectory matters more)
     recent = readings[-8:]
@@ -105,17 +141,20 @@ def project_1rm(
     ys = [v for _, v in recent]
 
     slope, intercept = _linear_regression(xs, ys)
-    current_1rm = recent[-1][1]
+    # Use MAX in window as current 1RM — intentionally lighter sessions shouldn't pull it down.
+    # The regression slope reflects the trend; the max reflects actual capability.
+    current_1rm = max(v for _, v in recent)
+    latest_date = recent[-1][0]  # most recent date for projection anchor
 
     projected_end = None
     if weeks_remaining is not None:
-        current_x = _weeks_since(reference_date, recent[-1][0])
+        current_x = _weeks_since(reference_date, latest_date)
         projected_end = round(slope * (current_x + weeks_remaining) + intercept, 1)
 
     on_track = None
     weeks_to_target = None
     if target_1rm is not None and slope > 0:
-        current_x = _weeks_since(reference_date, recent[-1][0])
+        current_x = _weeks_since(reference_date, latest_date)
         weeks_to_target = (target_1rm - current_1rm) / slope if slope > 0 else None
         if weeks_to_target is not None:
             on_track = (weeks_remaining is None) or (weeks_to_target <= weeks_remaining)
