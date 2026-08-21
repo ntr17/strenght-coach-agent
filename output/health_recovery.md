@@ -1,5 +1,5 @@
 # Health & Recovery
-Generated: 2026-08-20
+Generated: 2026-08-21
 
 ## Garmin Daily Log
 
